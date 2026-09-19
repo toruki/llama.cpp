@@ -3910,9 +3910,21 @@ llama_context * llama_init_from_model(
         }
     }
 
+    if (params.type_v == GGML_TYPE_Q2_E8) {
+        LLAMA_LOG_ERROR("%s: q2_e8 is a K-only cache type; use it with --cache-type-k and keep "
+                "--cache-type-v at q4_0\n", __func__);
+        return nullptr;
+    }
+
     if (params.path_kv_mean_center != nullptr && params.type_k != GGML_TYPE_Q4_0) {
         LLAMA_LOG_ERROR("%s: path_kv_mean_center requires the K cache type to be Q4_0 (got %s)\n",
                 __func__, ggml_type_name(params.type_k));
+        if (params.type_k == GGML_TYPE_Q4_0_E8 || params.type_k == GGML_TYPE_Q2_E8) {
+            // the bias is calibrated with the Hadamard K-rotation off, but the E8 quantizers are
+            // only meaningful with it on, so the two cannot be combined as things stand
+            LLAMA_LOG_ERROR("%s: the E8 K types require the Hadamard K-rotation, while a "
+                    "mean-centering bias is calibrated with it disabled\n", __func__);
+        }
         return nullptr;
     }
 

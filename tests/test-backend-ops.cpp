@@ -2440,7 +2440,7 @@ struct test_set_rows : public test_case {
 
     double max_nmse_err() override {
         if (type_dst == GGML_TYPE_Q2_0 || type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 ||
-            type_dst == GGML_TYPE_IQ4_NL ||
+            type_dst == GGML_TYPE_IQ4_NL || type_dst == GGML_TYPE_Q4_0_E8 || type_dst == GGML_TYPE_Q2_E8 ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-1,1], so it'll be
@@ -2455,6 +2455,11 @@ struct test_set_rows : public test_case {
             }
             if (type_dst == GGML_TYPE_Q8_0) {
                 err_estimate /= 8.0f;
+            }
+            if (type_dst == GGML_TYPE_Q2_E8) {
+                // a disagreement between the CPU and CUDA encoders flips a whole 8-dim
+                // subvector, not a single code
+                err_estimate *= 8.0f;
             }
             err_estimate *= err_estimate;
             if (type_src == GGML_TYPE_F16) {
@@ -2969,6 +2974,7 @@ struct test_cpy : public test_case {
             return 0.0;
         }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
+            type_dst == GGML_TYPE_Q4_0_E8 || type_dst == GGML_TYPE_Q2_E8 ||
             type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-150,150], so it'll be
@@ -2984,6 +2990,9 @@ struct test_cpy : public test_case {
             }
             if (type_dst == GGML_TYPE_Q8_0) {
                 err_estimate /= 8.0f;
+            }
+            if (type_dst == GGML_TYPE_Q2_E8) {
+                err_estimate *= 8.0f;
             }
             err_estimate *= err_estimate;
             err_estimate /= (150.0f*150.0f*0.25f)*float(total_elements());
@@ -8554,6 +8563,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // E8-lattice KV-cache types: not in all_types (they have no mul_mat kernels), so they get
+    // their own set_rows coverage. 256 is the head dim these are built for.
+    for (ggml_type type : { GGML_TYPE_Q4_0_E8, GGML_TYPE_Q2_E8 }) {
+        for (int b : {1, 7}) {
+            for (bool v : {false, true}) {
+                test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I64, { 256, 5,  b, 3 }, { 1, 1, }, 1, v));
+                test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I64, { 256, 11, 1, b }, { 2, 3, }, 7, v));
+                test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, type, GGML_TYPE_I64, { 3*ggml_blck_size(type), 3, b, 1 }, { 2, 3, }, 2, v));
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, true));
@@ -8975,6 +8996,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // quant block count not a multiple of the kernel block size
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
+    // E8-lattice KV-cache types, both directions (the KV-shift path needs quant -> f32 too)
+    for (ggml_type type : { GGML_TYPE_Q4_0_E8, GGML_TYPE_Q2_E8 }) {
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, type, {256, 4, 4, 4}));
+        test_cases.emplace_back(new test_cpy(type, GGML_TYPE_F32, {256, 4, 4, 4}));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, type, {256, 2, 3, 4}, {-1,-1,-1,-1}, {0, 2, 1, 3}));
+    }
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));
@@ -10048,6 +10075,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int nb : { 32, 64, }) {
                 for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, }) {
                     test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV));
+                }
+            }
+        }
+    }
+
+    // Compressed KV-cache presets: a narrow K next to a q4_0 V, in the 24/4 GQA shape of the
+    // Bonsai 27B. nb <= 2 takes the vector kernel, nb >= 3 the MMA kernel via dequantization.
+    for (int kv : { 512, 1024, }) {
+        for (int hs : { 64, 128, 256, }) {
+            for (int nb : { 1, 2, 3, 32, }) {
+                for (auto kv_types : { std::make_pair(GGML_TYPE_Q8_0,    GGML_TYPE_Q4_0),
+                                       std::make_pair(GGML_TYPE_Q4_0_E8, GGML_TYPE_Q4_0),
+                                       std::make_pair(GGML_TYPE_Q2_E8,   GGML_TYPE_Q4_0) }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                                hs, hs, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                kv_types.first, kv_types.second));
                 }
             }
         }
