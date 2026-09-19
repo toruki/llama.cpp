@@ -434,7 +434,11 @@ extern "C" {
         // slots above upstream types; type_traits is sized to COUNT (143) with 43..141 unused.
         GGML_TYPE_PQ2_0 = 142,
         GGML_TYPE_PTQ1_0 = 143, // Prism-private ternary, group 128
-        GGML_TYPE_COUNT   = 144,
+        // E8-lattice KV-cache types (ported from ninfer). KV-cache only: they are never
+        // written to a GGUF and have no GGML_FTYPE / mul_mat support.
+        GGML_TYPE_Q4_0_E8 = 144, // block_q4_0 layout, E8-lattice quantizer (rk4v4-e8 K)
+        GGML_TYPE_Q2_E8   = 145, // E8 root + log-radius/axis, group 64 (rk2v4-e8 K)
+        GGML_TYPE_COUNT   = 146,
     };
 
     // precision

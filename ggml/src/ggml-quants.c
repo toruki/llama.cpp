@@ -2,6 +2,7 @@
 #include "ggml-common.h"
 
 #include "ggml-quants.h"
+#include "ggml-e8.h"
 #include "ggml-impl.h"
 #include "ggml-cpu/ggml-cpu-impl.h"
 #include "ggml-cpu.h"
@@ -2294,6 +2295,129 @@ size_t quantize_ptq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst
         qrow += row_size;
     }
     return nrow * row_size;
+}
+
+//
+// ============================ E8-lattice KV-cache types ============================
+//
+// Both types quantize a *Hadamard-rotated* K vector; the rotation itself is applied by the
+// graph (llama_kv_cache::build_input_k_rot), not here. Unlike the stock q4_0 quantizer these
+// use ninfer's absmax/7 scale, fp16-rounded before it is used, so that the CPU and CUDA
+// encoders agree bit-for-bit.
+//
+
+// q4_0_e8: block_q4_0 storage, E8-projected codes. Dequantization is dequantize_row_q4_0().
+void quantize_row_q4_0_e8_ref(const float * GGML_RESTRICT x, block_q4_0_e8 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK4_0_E8;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+        float max  = 0.0f;
+
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            if (amax < fabsf(v)) {
+                amax = fabsf(v);
+                max  = v;
+            }
+        }
+
+        // Same scale rule as q4_0 (the block's largest element lands exactly on -8), so the
+        // only thing that differs from q4_0 is the rounding. ninfer uses absmax/7 instead,
+        // but its int4 codes are symmetric [-7,7] while this layout represents [-8,7], and
+        // absmax/7 measurably loses resolution against stock q4_0 on the same storage.
+        y[i].d = GGML_FP32_TO_FP16(max / -8.0f);
+
+        const float d  = GGML_FP16_TO_FP32(y[i].d);
+        const float id = d ? 1.0f/d : 0.0f;
+
+        int8_t codes[QK4_0_E8];
+        for (int s = 0; s < qk/8; ++s) {
+            float sub[8], proj[8];
+            for (int t = 0; t < 8; ++t) { sub[t] = x[i*qk + s*8 + t]*id; }
+            ggml_e8_project_8d(sub, proj);
+            for (int t = 0; t < 8; ++t) {
+                // The nearest E8 point may lie in the D8+1/2 coset. The packed nibbles have no
+                // coset bit, so the half-integer coset is deliberately collapsed here and is
+                // never reconstructed -- a source-compatible approximation inherited from
+                // ninfer, not an exact E8 representation.
+                int q = (int) rintf(proj[t]);
+                if (q < -8) { q = -8; }
+                if (q >  7) { q =  7; }
+                codes[s*8 + t] = (int8_t) q;
+            }
+        }
+
+        for (int j = 0; j < qk/2; ++j) {
+            const uint8_t xi0 = (uint8_t) (codes[j]         + 8);
+            const uint8_t xi1 = (uint8_t) (codes[qk/2 + j]  + 8);
+            y[i].qs[j] = (uint8_t) (xi0 | (xi1 << 4));
+        }
+    }
+}
+
+size_t quantize_q4_0_e8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights); // an E8 projection has no imatrix formulation
+    quantize_row_q4_0_e8_ref(src, (block_q4_0_e8 *) dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q4_0_E8, n_per_row);
+}
+
+// q2_e8: per 64 values one fp16 scale plus eight (root, radius|axis) byte pairs.
+void quantize_row_q2_e8_ref(const float * GGML_RESTRICT x, block_q2_e8 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_E8;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = fabsf(x[i*qk + j]);
+            if (amax < v) { amax = v; }
+        }
+
+        y[i].d = GGML_FP32_TO_FP16(amax > 0.0f ? amax/7.0f : 0.0f);
+
+        const float d = GGML_FP16_TO_FP32(y[i].d);
+
+        for (int s = 0; s < qk/8; ++s) {
+            uint8_t root = 0, rad_axis = 0;
+            ggml_e8_encode_cylinder_8d(&x[i*qk + s*8], d, &root, &rad_axis);
+            y[i].qs[2*s + 0] = root;
+            y[i].qs[2*s + 1] = rad_axis;
+        }
+    }
+}
+
+void dequantize_row_q2_e8(const block_q2_e8 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_E8;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int s = 0; s < qk/8; ++s) {
+            int8_t codes[8];
+            ggml_e8_root_decode_8d(x[i].qs[2*s + 0], x[i].qs[2*s + 1], codes);
+            for (int t = 0; t < 8; ++t) {
+                y[i*qk + s*8 + t] = codes[t]*d;
+            }
+        }
+    }
+}
+
+size_t quantize_q2_e8(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    GGML_UNUSED(quant_weights);
+    quantize_row_q2_e8_ref(src, (block_q2_e8 *) dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q2_E8, n_per_row);
 }
 
 size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -5719,6 +5843,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q4_0:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_0, data, nb);
+            } break;
+        case GGML_TYPE_Q4_0_E8:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_0_e8, data, nb);
+            } break;
+        case GGML_TYPE_Q2_E8:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q2_e8, data, nb);
             } break;
         case GGML_TYPE_Q4_1:
             {

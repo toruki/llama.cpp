@@ -108,6 +108,14 @@ typedef sycl::half2 ggml_half2;
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
 
+#define QI4_0_E8 QI4_0
+#define QR4_0_E8 QR4_0
+
+// QR2_E8 is 1: dequantize_q2_e8() returns the consecutive pair (iqs, iqs+1), not q4_0's
+// (iqs, iqs+QK/2) pairing. Every consumer must use the QR==1 convention.
+#define QI2_E8 (QK2_E8 / 32)
+#define QR2_E8 1
+
 #define QI4_1 (QK4_1 / (4 * QR4_1))
 #define QR4_1 2
 
@@ -225,6 +233,23 @@ typedef struct {
     uint8_t qs[QK4_0 / 2]; // nibbles / quants
 } block_q4_0;
 static_assert(sizeof(block_q4_0) == sizeof(ggml_half) + QK4_0 / 2, "wrong q4_0 block size/padding");
+
+// q4_0_e8 (rk4v4-e8 K cache): byte-identical to block_q4_0. Only the *quantizer* differs --
+// each 8-dim subvector of x/scale is projected onto the nearest E8 lattice point before the
+// nibbles are written. Dequantization, vec_dot and the FlashAttention kernels are the q4_0
+// ones. Ported from ninfer (UDPSendToFailed/ninfer-4090 lineage).
+#define QK4_0_E8 QK4_0
+typedef block_q4_0 block_q4_0_e8;
+
+// q2_e8 (rk2v4-e8 K cache): one fp16 scale per 64 values, then per 8-dim subvector a
+// 240-entry E8 root index and a packed (4-bit log-radius | 4-bit hyperoctahedral axis) byte.
+// 18 B per 64 values = 2.25 bpw. K-only: there is no V-side kernel for it.
+#define QK2_E8 64
+typedef struct {
+    ggml_half d;            // scale (absmax/7 of the group, fp16-rounded)
+    uint8_t qs[QK2_E8 / 4]; // 8 x { root index, (rad_idx << 4) | axis_idx }
+} block_q2_e8;
+static_assert(sizeof(block_q2_e8) == sizeof(ggml_half) + QK2_E8 / 4, "wrong q2_e8 block size/padding");
 
 #define QK4_1 32
 typedef struct {
@@ -1159,6 +1184,98 @@ GGML_TABLE_END()
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f
 #define IQ1M_DELTA 0.125f
+
+// ---------------------------------------------------------------------------------------------
+// E8 lattice tables for the q2_e8 KV-cache type.
+//
+// Ported from ninfer (design credit: UDPSendToFailed/ninfer-4090, Don-Chad/ninfer-3090 lineage).
+// e8_root_i8x8[c] packs the eight int8 components of E8 minimal vector `c`, scaled by 4:
+//   c <  112: type A, a permutation of (+-1,+-1,0,0,0,0,0,0)  -> components +-4
+//   c >= 112: type B, 1/2 (+-1)^8 with even parity            -> components +-2
+//   c >= 240: unused (a root index is always in [0,239])
+// e8_axis_i8x8[a] is the signed unit vector +-e_{a>>1} (sign bit a&1), the residual axis.
+// e8_radius_scale[r] = 0.5 * 2^((r-8)/3) is the 4-bit logarithmic radius; r == 0 means "zero".
+// Decode: code[i] = rint((e8_root_i8x8[root][i] + e8_axis_i8x8[axis][i]) * e8_radius_scale[rad]).
+// ---------------------------------------------------------------------------------------------
+
+GGML_TABLE_BEGIN(uint64_t, e8_root_i8x8, 256)
+    0x000000000000fcfc, 0x00000000000004fc, 0x000000000000fc04, 0x0000000000000404,
+    0x0000000000fc00fc, 0x00000000000400fc, 0x0000000000fc0004, 0x0000000000040004,
+    0x00000000fc0000fc, 0x00000000040000fc, 0x00000000fc000004, 0x0000000004000004,
+    0x000000fc000000fc, 0x00000004000000fc, 0x000000fc00000004, 0x0000000400000004,
+    0x0000fc00000000fc, 0x00000400000000fc, 0x0000fc0000000004, 0x0000040000000004,
+    0x00fc0000000000fc, 0x00040000000000fc, 0x00fc000000000004, 0x0004000000000004,
+    0xfc000000000000fc, 0x04000000000000fc, 0xfc00000000000004, 0x0400000000000004,
+    0x0000000000fcfc00, 0x000000000004fc00, 0x0000000000fc0400, 0x0000000000040400,
+    0x00000000fc00fc00, 0x000000000400fc00, 0x00000000fc000400, 0x0000000004000400,
+    0x000000fc0000fc00, 0x000000040000fc00, 0x000000fc00000400, 0x0000000400000400,
+    0x0000fc000000fc00, 0x000004000000fc00, 0x0000fc0000000400, 0x0000040000000400,
+    0x00fc00000000fc00, 0x000400000000fc00, 0x00fc000000000400, 0x0004000000000400,
+    0xfc0000000000fc00, 0x040000000000fc00, 0xfc00000000000400, 0x0400000000000400,
+    0x00000000fcfc0000, 0x0000000004fc0000, 0x00000000fc040000, 0x0000000004040000,
+    0x000000fc00fc0000, 0x0000000400fc0000, 0x000000fc00040000, 0x0000000400040000,
+    0x0000fc0000fc0000, 0x0000040000fc0000, 0x0000fc0000040000, 0x0000040000040000,
+    0x00fc000000fc0000, 0x0004000000fc0000, 0x00fc000000040000, 0x0004000000040000,
+    0xfc00000000fc0000, 0x0400000000fc0000, 0xfc00000000040000, 0x0400000000040000,
+    0x000000fcfc000000, 0x00000004fc000000, 0x000000fc04000000, 0x0000000404000000,
+    0x0000fc00fc000000, 0x00000400fc000000, 0x0000fc0004000000, 0x0000040004000000,
+    0x00fc0000fc000000, 0x00040000fc000000, 0x00fc000004000000, 0x0004000004000000,
+    0xfc000000fc000000, 0x04000000fc000000, 0xfc00000004000000, 0x0400000004000000,
+    0x0000fcfc00000000, 0x000004fc00000000, 0x0000fc0400000000, 0x0000040400000000,
+    0x00fc00fc00000000, 0x000400fc00000000, 0x00fc000400000000, 0x0004000400000000,
+    0xfc0000fc00000000, 0x040000fc00000000, 0xfc00000400000000, 0x0400000400000000,
+    0x00fcfc0000000000, 0x0004fc0000000000, 0x00fc040000000000, 0x0004040000000000,
+    0xfc00fc0000000000, 0x0400fc0000000000, 0xfc00040000000000, 0x0400040000000000,
+    0xfcfc000000000000, 0x04fc000000000000, 0xfc04000000000000, 0x0404000000000000,
+    0xfefefefefefefefe, 0x02fefefefefefe02, 0x02fefefefefe02fe, 0xfefefefefefe0202,
+    0x02fefefefe02fefe, 0xfefefefefe02fe02, 0xfefefefefe0202fe, 0x02fefefefe020202,
+    0x02fefefe02fefefe, 0xfefefefe02fefe02, 0xfefefefe02fe02fe, 0x02fefefe02fe0202,
+    0xfefefefe0202fefe, 0x02fefefe0202fe02, 0x02fefefe020202fe, 0xfefefefe02020202,
+    0x02fefe02fefefefe, 0xfefefe02fefefe02, 0xfefefe02fefe02fe, 0x02fefe02fefe0202,
+    0xfefefe02fe02fefe, 0x02fefe02fe02fe02, 0x02fefe02fe0202fe, 0xfefefe02fe020202,
+    0xfefefe0202fefefe, 0x02fefe0202fefe02, 0x02fefe0202fe02fe, 0xfefefe0202fe0202,
+    0x02fefe020202fefe, 0xfefefe020202fe02, 0xfefefe02020202fe, 0x02fefe0202020202,
+    0x02fe02fefefefefe, 0xfefe02fefefefe02, 0xfefe02fefefe02fe, 0x02fe02fefefe0202,
+    0xfefe02fefe02fefe, 0x02fe02fefe02fe02, 0x02fe02fefe0202fe, 0xfefe02fefe020202,
+    0xfefe02fe02fefefe, 0x02fe02fe02fefe02, 0x02fe02fe02fe02fe, 0xfefe02fe02fe0202,
+    0x02fe02fe0202fefe, 0xfefe02fe0202fe02, 0xfefe02fe020202fe, 0x02fe02fe02020202,
+    0xfefe0202fefefefe, 0x02fe0202fefefe02, 0x02fe0202fefe02fe, 0xfefe0202fefe0202,
+    0x02fe0202fe02fefe, 0xfefe0202fe02fe02, 0xfefe0202fe0202fe, 0x02fe0202fe020202,
+    0x02fe020202fefefe, 0xfefe020202fefe02, 0xfefe020202fe02fe, 0x02fe020202fe0202,
+    0xfefe02020202fefe, 0x02fe02020202fe02, 0x02fe0202020202fe, 0xfefe020202020202,
+    0x0202fefefefefefe, 0xfe02fefefefefe02, 0xfe02fefefefe02fe, 0x0202fefefefe0202,
+    0xfe02fefefe02fefe, 0x0202fefefe02fe02, 0x0202fefefe0202fe, 0xfe02fefefe020202,
+    0xfe02fefe02fefefe, 0x0202fefe02fefe02, 0x0202fefe02fe02fe, 0xfe02fefe02fe0202,
+    0x0202fefe0202fefe, 0xfe02fefe0202fe02, 0xfe02fefe020202fe, 0x0202fefe02020202,
+    0xfe02fe02fefefefe, 0x0202fe02fefefe02, 0x0202fe02fefe02fe, 0xfe02fe02fefe0202,
+    0x0202fe02fe02fefe, 0xfe02fe02fe02fe02, 0xfe02fe02fe0202fe, 0x0202fe02fe020202,
+    0x0202fe0202fefefe, 0xfe02fe0202fefe02, 0xfe02fe0202fe02fe, 0x0202fe0202fe0202,
+    0xfe02fe020202fefe, 0x0202fe020202fe02, 0x0202fe02020202fe, 0xfe02fe0202020202,
+    0xfe0202fefefefefe, 0x020202fefefefe02, 0x020202fefefe02fe, 0xfe0202fefefe0202,
+    0x020202fefe02fefe, 0xfe0202fefe02fe02, 0xfe0202fefe0202fe, 0x020202fefe020202,
+    0x020202fe02fefefe, 0xfe0202fe02fefe02, 0xfe0202fe02fe02fe, 0x020202fe02fe0202,
+    0xfe0202fe0202fefe, 0x020202fe0202fe02, 0x020202fe020202fe, 0xfe0202fe02020202,
+    0x02020202fefefefe, 0xfe020202fefefe02, 0xfe020202fefe02fe, 0x02020202fefe0202,
+    0xfe020202fe02fefe, 0x02020202fe02fe02, 0x02020202fe0202fe, 0xfe020202fe020202,
+    0xfe02020202fefefe, 0x0202020202fefe02, 0x0202020202fe02fe, 0xfe02020202fe0202,
+    0x020202020202fefe, 0xfe0202020202fe02, 0xfe020202020202fe, 0x0202020202020202,
+    0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000,
+    0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000,
+    0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000,
+    0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(uint64_t, e8_axis_i8x8, 16)
+    0x0000000000000001, 0x00000000000000ff, 0x0000000000000100, 0x000000000000ff00,
+    0x0000000000010000, 0x0000000000ff0000, 0x0000000001000000, 0x00000000ff000000,
+    0x0000000100000000, 0x000000ff00000000, 0x0000010000000000, 0x0000ff0000000000,
+    0x0001000000000000, 0x00ff000000000000, 0x0100000000000000, 0xff00000000000000,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, e8_radius_scale, 16)
+    0.0000f, 0.0992f, 0.1250f, 0.1575f, 0.1984f, 0.2500f, 0.3150f, 0.3969f, 0.5000f, 0.6300f, 0.7937f, 1.0000f, 1.2599f, 1.5874f, 2.0000f, 2.5198f,
+GGML_TABLE_END()
+
 #if defined(GGML_COMMON_IMPL_C)
 GGML_TABLE_BEGIN(uint64_t, iq1s_grid, NGRID_IQ1S)
     0xffffffffffffffff, 0xffffffffffffff01, 0xffffffffffff0000, 0xffffffffffff01ff,

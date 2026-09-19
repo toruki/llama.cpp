@@ -8,6 +8,8 @@
 
 #include "arch-fallback.h"
 
+#include "ggml-e8.h"
+
 #include <string.h>
 #include <assert.h>
 #include <float.h>
@@ -32,6 +34,14 @@ void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
 
 void quantize_row_pq2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_pq2_0_ref(x, y, k);
+}
+
+void quantize_row_q4_0_e8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_0_e8_ref(x, y, k);
+}
+
+void quantize_row_q2_e8(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q2_e8_ref(x, y, k);
 }
 
 void quantize_row_ptq1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
@@ -232,6 +242,46 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 
 // PQ2_0: 128 weights per block = four Q8_0 blocks (4 * 32). No arch defines
 // a SIMD variant yet, so this scalar path is the symbol referenced by the traits.
+// q2_e8 x q8_0. Each 64-value q2_e8 block spans two 32-value q8_0 blocks; the eight int8
+// codes of a subvector are decoded from the (root, radius|axis) pair before the dot product.
+void ggml_vec_dot_q2_e8_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_E8;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(qk % QK8_0 == 0);
+    UNUSED(bs);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(nrc);
+
+    const block_q2_e8 * GGML_RESTRICT x = vx;
+    const block_q8_0  * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        for (int s8 = 0; s8 < qk/8; ++s8) {
+            int8_t codes[8];
+            ggml_e8_root_decode_8d(x[i].qs[2*s8 + 0], x[i].qs[2*s8 + 1], codes);
+
+            const int j       = i*(qk/QK8_0) + (s8*8)/QK8_0; // owning q8_0 block
+            const int off     = (s8*8) % QK8_0;
+            const block_q8_0 * GGML_RESTRICT yb = &y[j];
+
+            int sumi = 0;
+            for (int t = 0; t < 8; ++t) {
+                sumi += (int) codes[t] * (int) yb->qs[off + t];
+            }
+            sumf += sumi * d * GGML_CPU_FP16_TO_FP32(yb->d);
+        }
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_pq2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK_PQ2_0;
     const int nb = n / qk;
