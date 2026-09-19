@@ -243,8 +243,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
-        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
-        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16); \
+        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16) \
+                              || (K->type == GGML_TYPE_Q4_0_E8 && (type_K) == GGML_TYPE_Q4_0);                   \
+        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16) \
+                              || (V->type == GGML_TYPE_Q4_0_E8 && (type_V) == GGML_TYPE_Q4_0);                   \
         if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                     \
             ggml_cuda_flash_attn_ext_vec_case<D, type_K, type_V>(ctx, dst);                                      \
             return;                                                                                              \
@@ -317,11 +319,17 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q5_1, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_BF16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q2_E8, GGML_TYPE_Q4_0)
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+
+    // compressed KV-cache presets: a narrow K next to a q4_0 V
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q2_E8, GGML_TYPE_Q4_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -349,10 +357,32 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_Q4_0_E8:
+        case GGML_TYPE_Q2_E8:
             return true;
         default:
             return false;
     }
+}
+
+// Without GGML_CUDA_FA_ALL_QUANTS only a fixed set of (K, V) instances is compiled. Same-type
+// pairs are always available; these mixed pairs exist so that the compressed KV-cache presets
+// (rk8v4, rk4v4-e8, rk2v4-e8) can keep V at q4_0 while K uses a narrower type.
+static bool ggml_cuda_fattn_kv_pair_supported(ggml_type type_K, ggml_type type_V) {
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+    GGML_UNUSED(type_K); GGML_UNUSED(type_V);
+    return true;
+#else
+    if (type_K == type_V) {
+        return true;
+    }
+    if (type_V == GGML_TYPE_Q4_0) {
+        return type_K == GGML_TYPE_Q8_0 || type_K == GGML_TYPE_Q4_0_E8 || type_K == GGML_TYPE_Q2_E8;
+    }
+    // q4_0_e8 is byte-identical to q4_0, so those two mix freely in either direction
+    return (type_K == GGML_TYPE_Q4_0_E8 && type_V == GGML_TYPE_Q4_0) ||
+           (type_K == GGML_TYPE_Q4_0    && type_V == GGML_TYPE_Q4_0_E8);
+#endif // GGML_CUDA_FA_ALL_QUANTS
 }
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -439,11 +469,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             return BEST_FATTN_KERNEL_NONE;
     }
 
-#ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+    if (!ggml_cuda_fattn_kv_pair_supported(K->type, V->type)) {
         return BEST_FATTN_KERNEL_NONE;
     }
-#endif // GGML_CUDA_FA_ALL_QUANTS
 
     if (!ggml_cuda_fattn_kv_type_supported(K->type) || !ggml_cuda_fattn_kv_type_supported(V->type)) {
         return BEST_FATTN_KERNEL_NONE;

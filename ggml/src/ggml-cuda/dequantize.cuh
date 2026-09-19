@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "convert.cuh"
+#include "ggml-e8.h"
 
 static __device__ __forceinline__ void dequantize_q1_0(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q1_0 * x = (const block_q1_0 *) vx;
@@ -84,6 +85,23 @@ static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const in
 
     v.x = (v.x - 8.0f) * d;
     v.y = (v.y - 8.0f) * d;
+}
+
+// q2_e8 has QR == 1, so this returns the *consecutive* pair (iqs, iqs+1); iqs is always even
+// and an 8-dim subvector never straddles the pair.
+static __device__ __forceinline__ void dequantize_q2_e8(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q2_e8 * x = (const block_q2_e8 *) vx;
+
+    const float d = __half2float(x[ib].d);
+
+    const int sub = iqs / 8;
+    const int off = iqs % 8;
+
+    int8_t codes[8];
+    ggml_e8_root_decode_8d(x[ib].qs[2*sub + 0], x[ib].qs[2*sub + 1], codes);
+
+    v.x = codes[off + 0] * d;
+    v.y = codes[off + 1] * d;
 }
 
 static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const int64_t ib, const int iqs, float2 & v){

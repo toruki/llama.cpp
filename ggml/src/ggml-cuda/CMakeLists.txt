@@ -121,7 +121,10 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-f16-f16.cu
             template-instances/fattn-vec-instance-q4_0-q4_0.cu
             template-instances/fattn-vec-instance-q8_0-q8_0.cu
-            template-instances/fattn-vec-instance-bf16-bf16.cu)
+            template-instances/fattn-vec-instance-bf16-bf16.cu
+            # mixed K/V pairs used by the compressed KV-cache presets (rk8v4, rk2v4-e8)
+            template-instances/fattn-vec-instance-q8_0-q4_0.cu
+            template-instances/fattn-vec-instance-q2_e8-q4_0.cu)
     endif()
 
     ggml_add_backend_library(ggml-cuda

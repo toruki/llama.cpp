@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "ggml-e8.h"
 
 #include <cstdint>
 
@@ -295,6 +296,44 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q5_1(
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
 
         sum += K_dm.x*Q_ds.x*sumi + K_dm.y*Q_ds.y/QI8_1;
+    }
+
+    return sum;
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q2_e8(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_q2_e8 * K_q2_e8 = (const block_q2_e8 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib   = k_KQ / (QK2_E8/4); // 64 values = 16 groups of 4 per block
+        const int loc  = k_KQ % (QK2_E8/4);
+        const int sub  = loc >> 1;          // 8-dim subvector inside the block
+        const int hlf  = loc &  1;          // which half of it this group of 4 covers
+
+        // a q2_e8 block is 18 bytes, so its code bytes are only 2-byte aligned
+        uint8_t rc[2];
+        ggml_cuda_memcpy_1<2, 2>(rc, K_q2_e8[ib].qs + 2*sub);
+
+        int8_t codes[8];
+        ggml_e8_root_decode_8d(rc[0], rc[1], codes);
+
+        int v;
+        ggml_cuda_memcpy_1<sizeof(v), 1>(&v, codes + 4*hlf);
+
+        const float2 * Q_ds = (const float2 *) Q_ds_v;
+        const float Q_d = Q_ds[k_KQ_0/nthreads].x;
+
+        // the codes are signed, so there is no +8 offset to cancel (unlike q4_0)
+        sum += vec_dot_q8_0_q8_1_impl<float, 1>(&v, &Q_q8[k_KQ_0/nthreads], K_q2_e8[ib].d, Q_d);
     }
 
     return sum;
@@ -631,6 +670,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_Q2_E8) {
+        return vec_dot_fattn_vec_KQ_q2_e8<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else {
