@@ -1294,6 +1294,7 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
             case LLM_ARCH_QWEN35:
             case LLM_ARCH_QWEN35MOE:
             case LLM_ARCH_QWEN3NEXT:
+            case LLM_ARCH_QWEN4EXP:
             case LLM_ARCH_DSPARK:
                 break;
             default:
