@@ -288,7 +288,24 @@ static void llama_tensor_dequantize_impl(
 
 static bool tensor_allows_quantization(const llama_model_quantize_params * params, llm_arch arch, const ggml_tensor * tensor) {
     // trivial checks first -- no string ops needed
-    if (params->only_copy)       return false;
+    if (params->only_copy) {
+        // COPY still honours an explicit --tensor-type: it is the only way to convert a
+        // handful of named tensors (e.g. the MoE experts) while leaving a mixed-precision
+        // model otherwise untouched.
+        bool named = false;
+        if (params->tt_overrides) {
+            const std::string tensor_name = ggml_get_name(tensor);
+            for (const auto * p = params->tt_overrides; p->pattern != nullptr; p++) {
+                if (std::regex_search(tensor_name, std::regex(p->pattern))) {
+                    named = true;
+                    break;
+                }
+            }
+        }
+        if (!named) {
+            return false;
+        }
+    }
 
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
@@ -710,6 +727,19 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
     }
 
     ggml_type new_type = default_type;
+
+    // --tensor-type under COPY: the default type carries no information, take the override
+    if (params->only_copy && !qs.tensor_type_patterns.empty()) {
+        const std::string tensor_name(tensor->name);
+        for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+            if (std::regex_search(tensor_name, pattern)) {
+                LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
+                               __func__, tensor_name.c_str(), ggml_type_name(tensor->type), ggml_type_name(qtype));
+                return qtype;
+            }
+        }
+        return tensor->type;
+    }
 
     // get more optimal quantization type based on the tensor shape, layer, etc.
     if (ggml_is_quantized(default_type)) {
