@@ -1,0 +1,204 @@
+#include "llama-expert-cache.h"
+
+#include "llama-impl.h"
+#include "llama-model.h"
+
+#include "ggml-alloc.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+
+llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_dev_t dev, uint32_t slots_)
+    : slots(slots_), n_layer((int) model.hparams.n_layer()), n_expert((int) model.hparams.n_expert) {
+    if (slots < 2 * model.hparams.n_expert_used) {
+        throw std::runtime_error("expert cache: too few slots");
+    }
+    per_layer.resize(n_layer);
+
+    // the banks are shaped like layer 0's routed experts; every cached layer must match
+    const ggml_tensor * g0 = nullptr;
+    const ggml_tensor * u0 = nullptr;
+    const ggml_tensor * d0 = nullptr;
+    int n_covered = 0;
+    // LLAMA_EXPERT_CACHE_LAYERS="a-b" restricts the cache to layers a..b (testing aid)
+    int lay_lo = 0, lay_hi = n_layer - 1;
+    if (const char * env = getenv("LLAMA_EXPERT_CACHE_LAYERS")) {
+        if (sscanf(env, "%d-%d", &lay_lo, &lay_hi) != 2) {
+            throw std::runtime_error("expert cache: bad LLAMA_EXPERT_CACHE_LAYERS");
+        }
+    }
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & L = model.layers[il];
+        auto & src = per_layer[il];
+        src.cache = this; src.il = il;
+        if (!L.ffn_gate_exps || !L.ffn_up_exps || !L.ffn_down_exps || il < lay_lo || il > lay_hi) {
+            continue;
+        }
+        bool host = true;
+        for (const ggml_tensor * t : {L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps}) {
+            if (!t->buffer || !ggml_backend_buffer_is_host(t->buffer) || t->data == nullptr) {
+                host = false;
+            }
+        }
+        if (!host) {
+            LLAMA_LOG_WARN("%s: layer %d routed experts are not in host memory, not cached\n", __func__, il);
+            continue;
+        }
+        if (!g0) { g0 = L.ffn_gate_exps; u0 = L.ffn_up_exps; d0 = L.ffn_down_exps; }
+        bool same = true;
+        for (auto pr : {std::make_pair(g0, (const ggml_tensor *) L.ffn_gate_exps),
+                        std::make_pair(u0, (const ggml_tensor *) L.ffn_up_exps),
+                        std::make_pair(d0, (const ggml_tensor *) L.ffn_down_exps)}) {
+            const ggml_tensor * a = pr.first; const ggml_tensor * b = pr.second;
+            same &= a->type == b->type && a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1] && a->ne[2] == b->ne[2] &&
+                    a->nb[1] == b->nb[1] && a->nb[2] == b->nb[2] && ggml_is_contiguous(b);
+        }
+        if (!same) {
+            LLAMA_LOG_WARN("%s: layer %d routed experts differ from layer 0 (gate %s/%s, up %s/%s, down %s/%s), not cached\n",
+                    __func__, il, ggml_type_name(L.ffn_gate_exps->type), ggml_type_name(g0->type),
+                    ggml_type_name(L.ffn_up_exps->type), ggml_type_name(u0->type),
+                    ggml_type_name(L.ffn_down_exps->type), ggml_type_name(d0->type));
+            continue;
+        }
+        src.gate = L.ffn_gate_exps; src.up = L.ffn_up_exps; src.down = L.ffn_down_exps;
+        n_covered++;
+    }
+    if (!g0) {
+        throw std::runtime_error("expert cache: no routed experts in host memory (use --cpu-moe)");
+    }
+    if (g0->ne[2] != n_expert) {
+        throw std::runtime_error("expert cache: unexpected expert count");
+    }
+
+    // device banks
+    ggml_init_params ip = { /*.mem_size =*/ ggml_tensor_overhead() * 8, /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    bank_ctx.reset(ggml_init(ip));
+    ggml_context * ctx = bank_ctx.get();
+    t_gate = ggml_new_tensor_3d(ctx, g0->type, g0->ne[0], g0->ne[1], slots); ggml_set_name(t_gate, "expert_cache.gate");
+    t_up   = ggml_new_tensor_3d(ctx, u0->type, u0->ne[0], u0->ne[1], slots); ggml_set_name(t_up,   "expert_cache.up");
+    t_down = ggml_new_tensor_3d(ctx, d0->type, d0->ne[0], d0->ne[1], slots); ggml_set_name(t_down, "expert_cache.down");
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    bank_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft));
+    if (!bank_buf) {
+        throw std::runtime_error("expert cache: failed to allocate the device banks");
+    }
+    ggml_backend_buffer_set_usage(bank_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    GGML_ASSERT(t_gate->nb[2] == g0->nb[2] && t_up->nb[2] == u0->nb[2] && t_down->nb[2] == d0->nb[2]);
+
+    slot_of.assign((size_t) n_layer * n_expert, -1);
+    gid_of.assign(slots, -1);
+    lru_prev.assign(slots, -1);
+    lru_next.assign(slots, -1);
+    free_slots.reserve(slots);
+    for (int32_t s = (int32_t) slots - 1; s >= 0; --s) {
+        free_slots.push_back(s);
+    }
+
+    const double slot_mib = (double) (g0->nb[2] + u0->nb[2] + d0->nb[2]) / (1024.0 * 1024.0);
+    LLAMA_LOG_INFO("%s: %u slots x %.3f MiB = %.2f GiB on %s, %d/%d layers cached (%.1f%% of their experts resident)\n",
+            __func__, slots, slot_mib, ggml_backend_buffer_get_size(bank_buf.get()) / (1024.0 * 1024.0 * 1024.0),
+            ggml_backend_dev_name(dev), n_covered, n_layer, 100.0 * slots / ((double) n_covered * n_expert));
+}
+
+llama_expert_cache::~llama_expert_cache() {
+    const int64_t total = hits + misses;
+    if (total > 0) {
+        LLAMA_LOG_INFO("%s: expert cache: %lld lookups, hit %.2f%%, %.2f MiB transferred per miss avg, %.1f GiB total\n",
+                __func__, (long long) total, 100.0 * hits / total,
+                misses ? (double) bytes_h2d / misses / (1024.0 * 1024.0) : 0.0, bytes_h2d / (1024.0 * 1024.0 * 1024.0));
+    }
+}
+
+bool llama_expert_cache::covers(int il, const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down) const {
+    if (il < 0 || il >= n_layer) {
+        return false;
+    }
+    const auto & s = per_layer[il];
+    return s.gate == gate && s.up == up && s.down == down && s.gate != nullptr;
+}
+
+void llama_expert_cache::touch(int32_t s) {
+    if (s == lru_head) {
+        return;
+    }
+    // unlink
+    if (lru_prev[s] >= 0) lru_next[lru_prev[s]] = lru_next[s];
+    if (lru_next[s] >= 0) lru_prev[lru_next[s]] = lru_prev[s];
+    if (lru_tail == s) lru_tail = lru_prev[s];
+    // push front
+    lru_prev[s] = -1;
+    lru_next[s] = lru_head;
+    if (lru_head >= 0) lru_prev[lru_head] = s;
+    lru_head = s;
+    if (lru_tail < 0) lru_tail = s;
+}
+
+int32_t llama_expert_cache::take_slot() {
+    if (!free_slots.empty()) {
+        const int32_t s = free_slots.back();
+        free_slots.pop_back();
+        // link as head
+        lru_prev[s] = -1; lru_next[s] = lru_head;
+        if (lru_head >= 0) lru_prev[lru_head] = s;
+        lru_head = s;
+        if (lru_tail < 0) lru_tail = s;
+        return s;
+    }
+    const int32_t s = lru_tail;
+    GGML_ASSERT(s >= 0);
+    slot_of[gid_of[s]] = -1;
+    gid_of[s] = -1;
+    touch(s);
+    return s;
+}
+
+void llama_expert_cache::prepare(int il, const int32_t * ids, int64_t k, int64_t n_tok, size_t nb_ids, int32_t * out, size_t nb_out) {
+    const auto & src = per_layer[il];
+    GGML_ASSERT(src.gate && "layer not covered by the expert cache");
+    const size_t nb2 = src.gate->nb[2];
+    std::vector<int32_t> miss_e;
+    for (int64_t t = 0; t < n_tok; ++t) {
+        const int32_t * row = (const int32_t *) ((const char *) ids + t * nb_ids);
+        int32_t * orow = (int32_t *) ((char *) out + t * nb_out);
+        miss_e.clear();
+        // first pass: hits are protected (moved to the MRU end) before any eviction
+        for (int64_t j = 0; j < k; ++j) {
+            const int32_t e = row[j];
+            GGML_ASSERT(e >= 0 && e < n_expert);
+            const int32_t s = slot_of[(size_t) il * n_expert + e];
+            if (s >= 0) {
+                touch(s); hits++; orow[j] = s;
+            } else {
+                miss_e.push_back((int32_t) j); orow[j] = -1;
+            }
+        }
+        for (int32_t j : miss_e) {
+            const int32_t e = row[j];
+            const size_t gid = (size_t) il * n_expert + e;
+            int32_t s = slot_of[gid];             // the same expert may appear twice in a row
+            if (s < 0) {
+                s = take_slot();
+                ggml_backend_tensor_set(t_gate, (const char *) src.gate->data + (size_t) e * nb2, (size_t) s * nb2, nb2);
+                ggml_backend_tensor_set(t_up,   (const char *) src.up->data   + (size_t) e * src.up->nb[2],   (size_t) s * src.up->nb[2],   src.up->nb[2]);
+                ggml_backend_tensor_set(t_down, (const char *) src.down->data + (size_t) e * src.down->nb[2], (size_t) s * src.down->nb[2], src.down->nb[2]);
+                bytes_h2d += nb2 + src.up->nb[2] + src.down->nb[2];
+                slot_of[gid] = s; gid_of[s] = (int32_t) gid;
+                misses++;
+            }
+            orow[j] = s;
+        }
+    }
+}
+
+void llama_expert_cache::prepare_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) {
+        return;
+    }
+    auto * src = (layer_src *) userdata;
+    GGML_ASSERT(a->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->ne[0] == dst->ne[0] && a->ne[1] == dst->ne[1]);
+    src->cache->prepare(src->il, (const int32_t *) a->data, a->ne[0], a->ne[1], a->nb[1], (int32_t *) dst->data, dst->nb[1]);
+}

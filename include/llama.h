@@ -401,6 +401,10 @@ extern "C" {
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
 
+        // number of (layer, expert) slots of the device expert cache for MoE decode; 0 = off.
+        // The routed expert weights must be kept in host memory (tensor_buft_overrides -> CPU).
+        uint32_t expert_cache_slots;
+
         // Keep the booleans together and at the end of the struct to avoid misalignment during copy-by-value.
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // offload the KQV ops (including the KV cache) to GPU

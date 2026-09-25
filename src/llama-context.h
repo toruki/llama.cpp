@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-expert-cache.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -355,6 +356,8 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    std::unique_ptr<llama_expert_cache> ecache;   // MoE decode expert cache (optional)
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

@@ -17,6 +17,8 @@ struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
 
+struct llama_expert_cache;
+
 struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
@@ -789,6 +791,7 @@ struct llm_graph_params {
     const llama_cross            * cross;
 
     const llama_prec_policy * prec_policy = nullptr;
+    llama_expert_cache * ecache = nullptr;   // MoE decode expert cache, may be null
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1029,6 +1032,7 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    llama_expert_cache * ecache;   // MoE decode expert cache, may be null
 
     const llama_prec_policy * prec_policy;
 
