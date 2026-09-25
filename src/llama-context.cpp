@@ -361,6 +361,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.expert_cache_slots = params.expert_cache_slots;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -718,6 +719,19 @@ void llama_context::sched_reserve() {
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+
+    if (cparams.expert_cache_slots > 0) {
+        if (model.devices.empty()) {
+            throw std::runtime_error("expert cache needs a GPU device");
+        }
+        try {
+            ecache.reset(new llama_expert_cache(model, model.devices[0].dev, cparams.expert_cache_slots));
+        } catch (const std::exception & e) {
+            // e.g. a probe context created without the CPU override for the routed experts
+            LLAMA_LOG_WARN("%s: expert cache disabled: %s\n", __func__, e.what());
+            ecache.reset();
+        }
+    }
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
@@ -2753,6 +2767,7 @@ llm_graph_params llama_context::graph_params(
         /*.dspark_ctx_width =*/dspark_ctx.n_embd_cap,
         /*.hadamard_rotations =*/&hadamard_rotations,
         /*.hadamard_inverses  =*/&hadamard_inverses,
+        /*.ecache      =*/ecache.get(),
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
         /*.cb          =*/graph_get_cb(),
@@ -3825,6 +3840,7 @@ llama_context_params llama_context_default_params() {
         /*.path_kv_mean_center         =*/ nullptr,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        /*.expert_cache_slots          =*/ 0,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
