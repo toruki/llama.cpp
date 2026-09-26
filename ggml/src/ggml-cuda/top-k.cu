@@ -47,6 +47,17 @@ static void top_k_cub(ggml_cuda_pool & pool,
     auto stream_env   = cuda::stream_ref{ stream };
     auto env          = cuda::std::execution::env{ stream_env, requirements };
 
+    // GGML_CUDA_TOPK_DET=0 restores the value-only selection (arbitrary among ties), for A/B tests
+    static const bool det = [] { const char * e = getenv("GGML_CUDA_TOPK_DET"); return e == nullptr || atoi(e) != 0; }();
+    if (!det) {
+        auto indexes_in = cuda::make_counting_iterator(0);
+        size_t temp_storage_bytes = 0;
+        CUDA_CHECK(DeviceTopK::MaxPairs(nullptr, temp_storage_bytes, src, cuda::discard_iterator(), indexes_in, dst, ncols, k, env));
+        ggml_cuda_pool_alloc<uint8_t> temp_storage_alloc(pool, temp_storage_bytes);
+        CUDA_CHECK(DeviceTopK::MaxPairs(temp_storage_alloc.get(), temp_storage_bytes, src, cuda::discard_iterator(), indexes_in, dst, ncols, k, env));
+        return;
+    }
+
     ggml_cuda_pool_alloc<unsigned long long> keys_alloc(pool, ncols + k);
     unsigned long long * keys_in  = keys_alloc.get();
     unsigned long long * keys_out = keys_in + ncols;
