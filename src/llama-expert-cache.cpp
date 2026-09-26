@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -68,6 +69,10 @@ llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_d
     if (!g0) {
         throw std::runtime_error("expert cache: no routed experts in host memory (use --cpu-moe)");
     }
+    this->n_covered = n_covered;
+    for (int il = 0; il < n_layer; ++il) { if (per_layer[il].gate) { first_covered = il; break; } }
+    use_count.assign((size_t) n_layer * n_expert, 0.0f);
+    if (const char * env = getenv("LLAMA_EXPERT_CACHE_WARM")) warm_enabled = atoi(env) != 0;
     if (g0->ne[2] != n_expert) {
         throw std::runtime_error("expert cache: unexpected expert count");
     }
@@ -198,10 +203,98 @@ int32_t llama_expert_cache::take_slot() {
     return s;
 }
 
+void llama_expert_cache::load_expert(int il, int32_t e, int32_t s, int & n_inflight) {
+    const auto & src = per_layer[il];
+    const size_t nb2 = src.gate->nb[2], nbu = src.up->nb[2], nbd = src.down->nb[2];
+    const char * pg = (const char *) src.gate->data + (size_t) e * nb2;
+    const char * pu = (const char *) src.up->data   + (size_t) e * nbu;
+    const char * pd = (const char *) src.down->data + (size_t) e * nbd;
+    if (staging) {
+        if (n_inflight == staging_n) {          // staging full: drain the queued copies
+            if (backend) ggml_backend_synchronize(backend);
+            n_inflight = 0;
+        }
+        uint8_t * st = staging + (size_t) n_inflight * (nb2 + nbu + nbd);
+        memcpy(st, pg, nb2); memcpy(st + nb2, pu, nbu); memcpy(st + nb2 + nbu, pd, nbd);
+        pg = (const char *) st; pu = pg + nb2; pd = pu + nbu;
+        n_inflight++;
+    }
+    if (staging && backend) {
+        // page-locked source: truly async on the device stream, synchronized by the caller
+        ggml_backend_tensor_set_async(backend, t_gate, pg, (size_t) s * nb2, nb2);
+        ggml_backend_tensor_set_async(backend, t_up,   pu, (size_t) s * nbu, nbu);
+        ggml_backend_tensor_set_async(backend, t_down, pd, (size_t) s * nbd, nbd);
+    } else {
+        ggml_backend_tensor_set(t_gate, pg, (size_t) s * nb2, nb2);
+        ggml_backend_tensor_set(t_up,   pu, (size_t) s * nbu, nbu);
+        ggml_backend_tensor_set(t_down, pd, (size_t) s * nbd, nbd);
+    }
+    bytes_h2d += nb2 + nbu + nbd;
+    const size_t gid = (size_t) il * n_expert + e;
+    slot_of[gid] = s; gid_of[s] = (int32_t) gid;
+}
+
+void llama_expert_cache::record(int il, const int32_t * ids, int64_t k, int64_t n_tok, size_t nb_ids) {
+    if (!warm_enabled) return;
+    if (il == first_covered) {
+        for (float & c : use_count) c *= 0.5f;                  // new ubatch: older prompt parts count less
+    }
+    float * cnt = use_count.data() + (size_t) il * n_expert;
+    for (int64_t t = 0; t < n_tok; ++t) {
+        const int32_t * row = (const int32_t *) ((const char *) ids + t * nb_ids);
+        for (int64_t j = 0; j < k; ++j) {
+            const int32_t e = row[j];
+            if (e >= 0 && e < n_expert) cnt[e] += 1.0f;
+        }
+    }
+    warm_pending = true;
+}
+
+void llama_expert_cache::warm_from_counts() {
+    warm_pending = false;
+    if (n_covered == 0) return;
+    const int per_layer_budget = (int) (slots / (uint32_t) n_covered);
+    std::vector<int32_t> order(n_expert);
+    int n_loaded = 0, n_inflight = 0;
+    for (int il = 0; il < n_layer; ++il) {
+        if (!per_layer[il].gate) continue;
+        const float * cnt = use_count.data() + (size_t) il * n_expert;
+        for (int e = 0; e < n_expert; ++e) order[e] = e;
+        const int m = std::min(per_layer_budget, n_expert);
+        std::partial_sort(order.begin(), order.begin() + m, order.end(), [cnt](int32_t a, int32_t b) { return cnt[a] > cnt[b]; });
+        for (int i = 0; i < m; ++i) {
+            const int32_t e = order[i];
+            if (cnt[e] <= 0.0f) break;
+            const size_t gid = (size_t) il * n_expert + e;
+            int32_t s = slot_of[gid];
+            if (s >= 0) { touch(s); continue; }
+            s = take_slot();
+            load_expert(il, e, s, n_inflight);
+            n_loaded++;
+        }
+    }
+    if (staging && backend && n_inflight > 0) ggml_backend_synchronize(backend);
+    LLAMA_LOG_INFO("%s: warmed the expert cache with %d experts from the prompt's routing\n", __func__, n_loaded);
+    std::fill(use_count.begin(), use_count.end(), 0.0f);
+}
+
+void llama_expert_cache::record_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    if (ith != 0) return;
+    auto * src = (layer_src *) userdata;
+    GGML_ASSERT(a->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
+    src->cache->record(src->il, (const int32_t *) a->data, a->ne[0], a->ne[1], a->nb[1]);
+    for (int64_t t = 0; t < a->ne[1]; ++t) {     // identity output: the graph consumes it so the op is scheduled
+        memcpy((char *) dst->data + t * dst->nb[1], (const char *) a->data + t * a->nb[1], a->ne[0] * sizeof(int32_t));
+    }
+}
+
 void llama_expert_cache::prepare(int il, const int32_t * ids, int64_t k, int64_t n_tok, size_t nb_ids, int32_t * out, size_t nb_out) {
+    if (warm_pending) {
+        warm_from_counts();
+    }
     const auto & src = per_layer[il];
     GGML_ASSERT(src.gate && "layer not covered by the expert cache");
-    const size_t nb2 = src.gate->nb[2];
     std::vector<int32_t> miss_e;
     for (int64_t t = 0; t < n_tok; ++t) {
         const int32_t * row = (const int32_t *) ((const char *) ids + t * nb_ids);
@@ -218,7 +311,6 @@ void llama_expert_cache::prepare(int il, const int32_t * ids, int64_t k, int64_t
                 miss_e.push_back((int32_t) j); orow[j] = -1;
             }
         }
-        const size_t nbu = src.up->nb[2], nbd = src.down->nb[2];
         int n_inflight = 0;
         for (int32_t j : miss_e) {
             const int32_t e = row[j];
@@ -226,31 +318,7 @@ void llama_expert_cache::prepare(int il, const int32_t * ids, int64_t k, int64_t
             int32_t s = slot_of[gid];             // the same expert may appear twice in a row
             if (s < 0) {
                 s = take_slot();
-                const char * pg = (const char *) src.gate->data + (size_t) e * nb2;
-                const char * pu = (const char *) src.up->data   + (size_t) e * nbu;
-                const char * pd = (const char *) src.down->data + (size_t) e * nbd;
-                if (staging) {
-                    if (n_inflight == staging_n) {          // staging full: drain the queued copies
-                        if (backend) ggml_backend_synchronize(backend);
-                        n_inflight = 0;
-                    }
-                    uint8_t * st = staging + (size_t) n_inflight * (nb2 + nbu + nbd);
-                    memcpy(st, pg, nb2); memcpy(st + nb2, pu, nbu); memcpy(st + nb2 + nbu, pd, nbd);
-                    pg = (const char *) st; pu = pg + nb2; pd = pu + nbu;
-                    n_inflight++;
-                }
-                if (staging && backend) {
-                    // page-locked source:真 async on the device stream, one synchronize per token below
-                    ggml_backend_tensor_set_async(backend, t_gate, pg, (size_t) s * nb2, nb2);
-                    ggml_backend_tensor_set_async(backend, t_up,   pu, (size_t) s * nbu, nbu);
-                    ggml_backend_tensor_set_async(backend, t_down, pd, (size_t) s * nbd, nbd);
-                } else {
-                    ggml_backend_tensor_set(t_gate, pg, (size_t) s * nb2, nb2);
-                    ggml_backend_tensor_set(t_up,   pu, (size_t) s * nbu, nbu);
-                    ggml_backend_tensor_set(t_down, pd, (size_t) s * nbd, nbd);
-                }
-                bytes_h2d += nb2 + nbu + nbd;
-                slot_of[gid] = s; gid_of[s] = (int32_t) gid;
+                load_expert(il, e, s, n_inflight);
                 misses++;
             }
             orow[j] = s;

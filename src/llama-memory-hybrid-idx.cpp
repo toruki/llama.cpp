@@ -50,6 +50,10 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
+        // the indexer only ever writes and reads K (build_qsa_indexer), so keep V at one element
+        // per cell instead of a full unused head (1.5 GiB at 256k)
+        hparams_idx.n_embd_head_v_full = 1;
+        hparams_idx.n_embd_head_v_swa  = 1;
 
         // the cached indexer keys are raw, rotation happens after pooling at read time, so a
         // K-shift must not rotate them while the stream copies in the same update still apply
