@@ -33,8 +33,12 @@ struct llama_expert_cache {
 
     // ggml_custom1_op_t: dst/a are I32 [k, n_tokens]; a = original expert ids, dst = slot ids
     static void prepare_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+    // ggml_custom1_op_t used during prefill: counts the routed experts (dst = a) so that the first
+    // decode token can warm the cache with the experts the prompt actually used
+    static void record_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
 
     uint32_t n_slots() const { return slots; }
+    bool     warm_on() const { return warm_enabled; }
     int64_t  n_hits()  const { return hits; }
     int64_t  n_miss()  const { return misses; }
     size_t   bytes_transferred() const { return bytes_h2d; }
@@ -49,6 +53,9 @@ private:
     };
 
     void prepare(int il, const int32_t * ids, int64_t k, int64_t n_tok, size_t nb_ids, int32_t * out, size_t nb_out);
+    void record(int il, const int32_t * ids, int64_t k, int64_t n_tok, size_t nb_ids);
+    void warm_from_counts();      // load the most used experts of the recorded prompt (once per prefill)
+    void load_expert(int il, int32_t e, int32_t s, int & n_inflight);   // one miss copy (staging aware)
     int32_t take_slot();          // free slot, or evict the least recently used one
     void    touch(int32_t slot);  // move to the most-recently-used end
 
@@ -73,6 +80,12 @@ private:
 
     int64_t hits = 0, misses = 0;
     size_t  bytes_h2d = 0;
+
+    std::vector<float> use_count;   // per gid, recorded during prefill (decayed per ubatch)
+    bool warm_pending = false;
+    bool warm_enabled = false;      // LLAMA_EXPERT_CACHE_WARM=1 enables the prefill warm-up (measured: not worth it)
+    int  n_covered = 0;
+    int  first_covered = -1;
 
     ggml_backend_t backend = nullptr;      // device backend (async copies), may be null
     ggml_backend_buffer_ptr staging_buf;   // optional page-locked staging for the misses

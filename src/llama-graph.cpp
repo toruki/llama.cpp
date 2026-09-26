@@ -2189,6 +2189,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ids_mm = ggml_map_custom1(ctx0, ids_c, llama_expert_cache::prepare_op, 1, ecache->userdata(il));
         cb(ids_mm, "ffn_moe_cache_ids", il);
         up_w = ecache->bank_up(); gate_w = ecache->bank_gate(); down_w = ecache->bank_down();
+    } else if (ecache && ecache->warm_on() && !cparams.warmup && n_tokens > 1 && ecache->covers(il, up_exps, gate_exps, down_exps)) {
+        // prefill: record which experts the prompt routes to, so the first decode token can warm the cache
+        ggml_tensor * ids_c = ggml_cont(ctx0, selected_experts);
+        ids_mm = ggml_map_custom1(ctx0, ids_c, llama_expert_cache::record_op, 1, ecache->userdata(il));
+        cb(ids_mm, "ffn_moe_record_ids", il);
     }
 
     if (gate_up_exps) {
