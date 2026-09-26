@@ -74,6 +74,9 @@ private:
     int64_t hits = 0, misses = 0;
     size_t  bytes_h2d = 0;
 
+    ggml_backend_buffer_ptr staging_buf;   // optional page-locked staging for the misses
+    uint8_t * staging = nullptr;
+
     std::vector<void *> pinned_ranges;
     void (*unreg_fn)(void *) = nullptr;
 };
