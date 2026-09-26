@@ -119,6 +119,22 @@ llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_d
         }
     }
 
+    // LLAMA_EXPERT_CACHE_STAGING=1: copy each missing expert through a page-locked staging buffer so the
+    // device transfer is a single DMA instead of the driver's chunked pageable copy
+    if (const char * env = getenv("LLAMA_EXPERT_CACHE_STAGING"); env && atoi(env) > 0) {
+        ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(dev);
+        const size_t need = g0->nb[2] + u0->nb[2] + d0->nb[2];
+        if (hbuft) {
+            staging_buf.reset(ggml_backend_buft_alloc_buffer(hbuft, need));
+        }
+        if (staging_buf) {
+            staging = (uint8_t *) ggml_backend_buffer_get_base(staging_buf.get());
+            LLAMA_LOG_INFO("%s: staging misses through %.2f MiB of page-locked host memory\n", __func__, need / (1024.0 * 1024.0));
+        } else {
+            LLAMA_LOG_WARN("%s: no page-locked host buffer type, staging disabled\n", __func__);
+        }
+    }
+
     const double slot_mib = (double) (g0->nb[2] + u0->nb[2] + d0->nb[2]) / (1024.0 * 1024.0);
     LLAMA_LOG_INFO("%s: %u slots x %.3f MiB = %.2f GiB on %s, %d/%d layers cached (%.1f%% of their experts resident)\n",
             __func__, slots, slot_mib, ggml_backend_buffer_get_size(bank_buf.get()) / (1024.0 * 1024.0 * 1024.0),
@@ -206,9 +222,17 @@ void llama_expert_cache::prepare(int il, const int32_t * ids, int64_t k, int64_t
             int32_t s = slot_of[gid];             // the same expert may appear twice in a row
             if (s < 0) {
                 s = take_slot();
-                ggml_backend_tensor_set(t_gate, (const char *) src.gate->data + (size_t) e * nb2, (size_t) s * nb2, nb2);
-                ggml_backend_tensor_set(t_up,   (const char *) src.up->data   + (size_t) e * src.up->nb[2],   (size_t) s * src.up->nb[2],   src.up->nb[2]);
-                ggml_backend_tensor_set(t_down, (const char *) src.down->data + (size_t) e * src.down->nb[2], (size_t) s * src.down->nb[2], src.down->nb[2]);
+                const size_t nbu = src.up->nb[2], nbd = src.down->nb[2];
+                const char * pg = (const char *) src.gate->data + (size_t) e * nb2;
+                const char * pu = (const char *) src.up->data   + (size_t) e * nbu;
+                const char * pd = (const char *) src.down->data + (size_t) e * nbd;
+                if (staging) {
+                    memcpy(staging, pg, nb2); memcpy(staging + nb2, pu, nbu); memcpy(staging + nb2 + nbu, pd, nbd);
+                    pg = (const char *) staging; pu = pg + nb2; pd = pu + nbu;
+                }
+                ggml_backend_tensor_set(t_gate, pg, (size_t) s * nb2, nb2);
+                ggml_backend_tensor_set(t_up,   pu, (size_t) s * nbu, nbu);
+                ggml_backend_tensor_set(t_down, pd, (size_t) s * nbd, nbd);
                 bytes_h2d += nb2 + src.up->nb[2] + src.down->nb[2];
                 slot_of[gid] = s; gid_of[s] = (int32_t) gid;
                 misses++;
