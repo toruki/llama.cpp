@@ -36,6 +36,84 @@ static __global__ void top_k_unpack_keys(const unsigned long long * __restrict__
     }
 }
 
+// Multi-row top-k in one launch: one thread block per row selects the k largest packed keys by radix
+// select (8 passes of 8 bits over the 64-bit key, histogram in shared memory), then collects the keys at or
+// above the k-th largest. The keys are unique, so exactly k are collected; the set is the same as the
+// per-row DeviceTopK path above (same key, same tie rule), the order within a row is arbitrary as there.
+// The keys are packed on the fly from the floats, so a row is read 9 times (4 bytes per element) and nothing
+// is materialized. Used for batched (prefill) rows: the per-row DeviceTopK costs ~8 launches per row.
+#define TOPK_SELECT_BLOCK 256
+
+static __global__ void k_top_k_select(const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k, const int64_t ncols_stride) {
+    const int row = blockIdx.x;
+    const float * x = src + (int64_t) row*ncols_stride;
+    int * out = dst + (int64_t) row*k;
+
+    __shared__ int hist[256];
+    __shared__ unsigned long long s_prefix;
+    __shared__ int s_remaining;
+    __shared__ int s_count;
+
+    if (threadIdx.x == 0) {
+        s_prefix = 0;
+        s_remaining = k;
+        s_count = 0;
+    }
+    __syncthreads();
+
+    unsigned long long prefix = 0;   // the digits chosen so far, in place
+    unsigned long long mask   = 0;   // which digits are chosen
+
+    for (int pass = 0; pass < 8; ++pass) {
+        const int shift = 56 - 8*pass;
+
+        for (int b = threadIdx.x; b < 256; b += blockDim.x) {
+            hist[b] = 0;
+        }
+        __syncthreads();
+
+        for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+            const unsigned long long key = ((unsigned long long) top_k_ordered_bits(x[i]) << 32) | (unsigned long long) (~(uint32_t) i);
+            if ((key & mask) == prefix) {
+                atomicAdd(&hist[(int) ((key >> shift) & 255)], 1);
+            }
+        }
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            // walk the digits from the largest: the k-th largest key lives in the first bin that
+            // brings the cumulative count to s_remaining; the keys in the higher bins are all selected
+            int cum = 0;
+            int chosen = 0;
+            for (int d = 255; d >= 0; --d) {
+                if (cum + hist[d] >= s_remaining) {
+                    chosen = d;
+                    break;
+                }
+                cum += hist[d];
+            }
+            s_remaining -= cum;
+            s_prefix = prefix | ((unsigned long long) chosen << shift);
+        }
+        __syncthreads();
+        prefix = s_prefix;
+        mask  |= (unsigned long long) 255 << shift;
+        __syncthreads();
+    }
+
+    // prefix is now the k-th largest key; collect every key at or above it
+    const unsigned long long threshold = prefix;
+    for (int i = threadIdx.x; i < ncols; i += blockDim.x) {
+        const unsigned long long key = ((unsigned long long) top_k_ordered_bits(x[i]) << 32) | (unsigned long long) (~(uint32_t) i);
+        if (key >= threshold) {
+            const int pos = atomicAdd(&s_count, 1);
+            if (pos < k) {
+                out[pos] = i;
+            }
+        }
+    }
+}
+
 static void top_k_cub(ggml_cuda_pool & pool,
                       const float *    src,
                       int *            dst,
@@ -265,9 +343,15 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
 #ifdef CUB_TOP_K_AVAILABLE
+    // batched rows: one radix-select launch for all rows (GGML_CUDA_TOPK_BATCH=0 falls back to the per-row loop)
+    static const bool batch_select = [] { const char * e = getenv("GGML_CUDA_TOPK_BATCH"); return e == nullptr || atoi(e) != 0; }();
+    if (batch_select && nrows > 1) {
+        GGML_ASSERT(nrows <= INT32_MAX && ncols <= INT32_MAX && k <= ncols);
+        k_top_k_select<<<(int) nrows, TOPK_SELECT_BLOCK, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k, ncols);
+        return;
+    }
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
-    // TODO: investigate if there exists a point where parallelized argsort is faster than sequential top-k
     for (int i = 0; i < nrows; i++) {
         top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
     }
