@@ -7,6 +7,7 @@
 
 
 #include <algorithm>
+#include <cstring>
 #include <cassert>
 #include <cmath>
 #include <iterator>
@@ -69,7 +70,170 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()) {
+    if (mem_idx == nullptr) {
+        return;
+    }
+
+    const char * env = getenv("LLAMA_QSA_POOLED");
+    if (env != nullptr && atoi(env) == 0) {
+        LLAMA_LOG_INFO("%s: persistent pooled indexer keys disabled (LLAMA_QSA_POOLED=0)\n", __func__);
+        return;
+    }
+
+    // one F32 row per block on the buffer type of the layer's indexer keys
+    const auto layer_ids = mem_idx->get_layer_ids();
+
+    ggml_backend_buffer_type_t buft = nullptr;
+    for (const uint32_t il : layer_ids) {
+        const uint32_t r = model.hparams.dsv4_compress_ratios[il];
+        if (r == 0) {
+            continue;
+        }
+        ggml_backend_buffer_type_t b = ggml_backend_buffer_get_type(mem_idx->get_k_storage(il)->buffer);
+        if (buft != nullptr && b != buft) {
+            LLAMA_LOG_WARN("%s: indexer layers on different buffer types, pooled keys disabled\n", __func__);
+            return;
+        }
+        buft = b;
+    }
+    if (buft == nullptr) {
+        return;
+    }
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ size_t(2u*layer_ids.size()*ggml_tensor_overhead()),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    pooled.ctx.reset(ggml_init(params));
+
+    for (const uint32_t il : layer_ids) {
+        const uint32_t r = model.hparams.dsv4_compress_ratios[il];
+        if (r == 0) {
+            continue;
+        }
+        ggml_tensor * t = ggml_new_tensor_2d(pooled.ctx.get(), GGML_TYPE_F32,
+                model.hparams.indexer_head_size, kv_size/r + QSA_POOLED_SCRATCH);
+        ggml_format_name(t, "idx_pooled_l%d", il);
+        pooled.t[(int) il] = t;
+    }
+
+    pooled.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(pooled.ctx.get(), buft));
+    if (!pooled.buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate the pooled indexer keys, disabled\n", __func__);
+        pooled.t.clear();
+        return;
+    }
+    // rows past the complete blocks are masked with -inf but still scored, so they must be finite
+    ggml_backend_buffer_clear(pooled.buf.get(), 0);
+    pooled.cell_blk.assign(kv_size, 0);
+
+    LLAMA_LOG_INFO("%s: pooled indexer keys: %zu layers, %s, %.1f MiB\n", __func__,
+            pooled.t.size(), ggml_backend_buft_name(buft), ggml_backend_buffer_get_size(pooled.buf.get())/1024.0/1024.0);
+}
+
+ggml_tensor * llama_memory_hybrid_idx::qsa_pooled(int il) const {
+    const auto it = pooled.t.find(il);
+    return it == pooled.t.end() ? nullptr : it->second;
+}
+
+bool llama_memory_hybrid_idx::qsa_fast_eligible(const llama_ubatch & ubatch, uint32_t ratio, bool blk_bias) const {
+    if (pooled.t.empty() || !pooled.valid || !blk_bias || ratio == 0) {
+        return false;
+    }
+    if (mem_idx->get_n_stream() != 1 || pooled.gen != mem_idx->get_edit_gen()) {
+        return false;
+    }
+    // one appended text token of the recorded sequence at the next position (M-RoPE text carries
+    // 3 identical position rows, so is_pos_2d() cannot tell text from an image; an image is an embd batch)
+    if (ubatch.n_tokens != 1 || ubatch.token == nullptr || ubatch.n_seq_id[0] != 1 || ubatch.seq_id[0][0] != pooled.seq) {
+        return false;
+    }
+    if (ubatch.pos[0] != (llama_pos) (pooled.n_bid*ratio + pooled.tail.size())) {
+        return false;
+    }
+    return true;
+}
+
+void llama_memory_hybrid_idx::set_input_qsa_fast(
+        ggml_tensor * upd_cells,
+        ggml_tensor * upd_pos,
+        ggml_tensor * upd_dst,
+        ggml_tensor * cell_blk,
+        ggml_tensor * bias,
+        const ggml_tensor * k_idxs,
+        const llama_ubatch * ubatch,
+        uint32_t ratio) const {
+    GGML_ASSERT(qsa_fast_eligible(*ubatch, ratio, true));
+    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+
+    static bool announced = false;
+    if (!announced) {
+        announced = true;
+        LLAMA_LOG_INFO("%s: pooled indexer keys: fast path active (pos %d, %u blocks)\n", __func__, (int) ubatch->pos[0], pooled.n_bid);
+    }
+
+    const int64_t r        = ratio;
+    const int64_t n_kv     = cell_blk->ne[0];
+    const int64_t n_blocks = bias->ne[0];
+    const int64_t n_upd    = upd_dst->ne[0];
+    const int64_t scratch  = (int64_t) (mem_idx->get_size()/ratio);   // first scratch row
+
+    GGML_ASSERT(n_upd == QSA_POOLED_N_UPD && upd_cells->ne[0] == r*n_upd && upd_pos->ne[0] == 4*n_upd);
+    GGML_ASSERT(cell_blk->ne[1] == 1 && bias->ne[1] == 1 && bias->ne[2] == 1);
+
+    int32_t * dst_cells = (int32_t *) upd_cells->data;
+    int32_t * dst_pos   = (int32_t *) upd_pos->data;
+    int32_t * dst_dst   = (int32_t *) upd_dst->data;
+
+    // the new token's cell, placed by the indexer cache for this ubatch (set_input_k_idxs, stream 0 so no offset)
+    GGML_ASSERT(k_idxs->type == GGML_TYPE_I64 && ggml_backend_buffer_is_host(k_idxs->buffer));
+    const int32_t cell = (int32_t) ((const int64_t *) k_idxs->data)[0];
+    GGML_ASSERT(cell >= 0 && cell < (int32_t) pooled.cell_blk.size());
+
+    auto & st = pooled;
+
+    st.tail.push_back(cell);
+
+    // row 0: the block this token completes, pooled from its r cells in position order
+    std::fill(dst_cells, dst_cells + r*n_upd, 0);
+    std::fill(dst_pos,   dst_pos   + 4*n_upd, 0);
+
+    if ((int64_t) st.tail.size() == r) {
+        const int32_t bid = (int32_t) st.n_bid;
+        GGML_ASSERT(bid < n_blocks);
+        for (int64_t i = 0; i < r; ++i) {
+            dst_cells[i] = st.tail[i];
+            st.cell_blk[st.tail[i]] = bid;
+        }
+        for (int64_t sec = 0; sec < 4; ++sec) {
+            dst_pos[sec*n_upd + 0] = bid*(int32_t) r;
+        }
+        dst_dst[0] = bid;
+        st.n_bid++;
+        st.tail.clear();
+    } else {
+        dst_dst[0] = (int32_t) scratch;
+    }
+
+    // row 1: the spare block the unpooled tail maps to. the full path pools it from cell 0 repeated
+    // (zero-filled member list) at position 0; reproduce that so both paths score identically
+    const int64_t dead = st.n_bid;
+    dst_dst[1] = dead < n_blocks ? (int32_t) dead : (int32_t) scratch + 1;
+
+    for (const int32_t c : st.tail) {
+        st.cell_blk[c] = (int32_t) dead;
+    }
+
+    memcpy(cell_blk->data, st.cell_blk.data(), n_kv*sizeof(int32_t));
+
+    // every complete block is before the query, the spare block is always visible, the rest is unused
+    float * dst_bias = (float *) bias->data;
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        dst_bias[b] = b < (int64_t) st.n_bid ? 0.0f : (b == dead ? 1e9f : -INFINITY);
+    }
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -589,6 +753,56 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 cur_bias[j] = v;
             }
         }
+
+        // record the layout for the fast path: stream 0 holding one sequence at positions 0..n-1,
+        // every cell in a complete block or in the tail, so block b is exactly positions [b*r, b*r + r)
+        if (s == 0 && !pooled.t.empty()) {
+            auto & st = pooled;
+            st.valid = false;
+
+            const bool canonical = n_ns == 1 && one_seq && !ranked && !oor && !dup && blk_bias;
+            if (canonical) {
+                std::vector<int32_t> tail;
+                int64_t n_used = 0;
+                bool ok = true;
+
+                for (int64_t j = 0; j < n_kv && ok; ++j) {
+                    if (cells.is_empty(j)) {
+                        continue;
+                    }
+                    n_used++;
+                    const int64_t idx = cells.pos_get(j);
+                    if (blk_of[j] >= 0) {
+                        ok = blk_of[j] == (int32_t) (idx/r);
+                    } else {
+                        ok = idx >= (int64_t) n_bid*r && idx < (int64_t) n_bid*r + r;
+                        tail.push_back((int32_t) j);
+                    }
+                }
+                // n_bid complete blocks cover positions [0, n_bid*r), the tail continues from there
+                ok = ok && n_used == (int64_t) n_bid*r + (int64_t) tail.size() && (int64_t) tail.size() < r;
+                // the cells past n_kv are empty (n_kv is the padded used range), nothing to check there
+
+                if (ok) {
+                    std::sort(tail.begin(), tail.end(), [&cells](int32_t a, int32_t b) {
+                        return cells.pos_get(a) < cells.pos_get(b);
+                    });
+                    for (size_t i = 0; i < tail.size(); ++i) {
+                        ok = ok && cells.pos_get(tail[i]) == (llama_pos) ((int64_t) n_bid*r + (int64_t) i);
+                    }
+                }
+
+                if (ok) {
+                    st.valid = true;
+                    st.gen   = mem_idx->get_edit_gen();
+                    st.seq   = seq_of_stream;
+                    st.n_bid = (uint32_t) n_bid;
+                    st.tail  = std::move(tail);
+                    std::fill(st.cell_blk.begin(), st.cell_blk.end(), 0);
+                    memcpy(st.cell_blk.data(), cur_cell_blk, n_kv*sizeof(int32_t));
+                }
+            }
+        }
     }
 }
 
@@ -684,4 +898,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(mem != nullptr);
 
     mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+}
+
+const llama_memory_hybrid_idx * llama_memory_hybrid_idx_context::get_mem() const {
+    return mem;
 }

@@ -2,6 +2,9 @@
 
 #include "llama-memory-hybrid.h"
 
+#include "ggml-cpp.h"
+
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -87,7 +90,39 @@ public:
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
 
+    // Persistent pooled indexer keys (post norm and rope), one row per complete block, per QSA layer.
+    // The full path above recomputes every block each ubatch; a single appended token can instead
+    // pool just the block it completes and write it with ggml_set_rows (the "fast" path). Valid only
+    // while the indexer cells hold one sequence at positions 0..n-1 in stream 0 and no cell was
+    // edited since the last full-path ubatch (edit_gen of the indexer cache).
+    //   qsa_pooled(il)     the [idx_dim, kv_size/ratio + QSA_POOLED_SCRATCH] F32 tensor, null if disabled
+    //   qsa_fast_eligible  whether the given ubatch can take the fast path (decided at graph build)
+    //   set_input_qsa_fast the fast-path inputs; n_upd rows: [0] = the block this token completes (or
+    //                      a scratch row), [1] = the spare block the unpooled tail maps to (or scratch)
+    static constexpr uint32_t QSA_POOLED_SCRATCH = 2;
+    static constexpr uint32_t QSA_POOLED_N_UPD   = 2;
+    ggml_tensor * qsa_pooled(int il) const;
+    bool qsa_fast_eligible(const llama_ubatch & ubatch, uint32_t ratio, bool blk_bias) const;
+    void set_input_qsa_fast(ggml_tensor * upd_cells, ggml_tensor * upd_pos, ggml_tensor * upd_dst,
+                            ggml_tensor * cell_blk, ggml_tensor * bias, const ggml_tensor * k_idxs,
+                            const llama_ubatch * ubatch, uint32_t ratio) const;
+
 private:
+    struct qsa_pooled_t {
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        std::map<int, ggml_tensor *> t;   // layer -> pooled keys
+
+        // committed layout of the pooled rows (stream 0, one sequence at positions 0..n-1)
+        bool         valid = false;
+        uint64_t     gen   = 0;           // indexer cache edit_gen the layout was recorded at
+        llama_seq_id seq   = -1;
+        uint32_t     n_bid = 0;           // rows [0, n_bid) hold complete blocks, block b = positions [b*r, b*r + r)
+        std::vector<int32_t> tail;        // cells of the incomplete block, in position order
+        std::vector<int32_t> cell_blk;    // per cell: its block, or the spare block (n_bid) for the tail
+    };
+    mutable qsa_pooled_t pooled;
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
@@ -137,6 +172,9 @@ public:
 
     // nullptr with no indexer
     const llama_kv_cache_context * get_idx() const;
+
+    // the memory, for the pooled-key fast path (qsa_pooled / qsa_fast_eligible / set_input_qsa_fast)
+    const llama_memory_hybrid_idx * get_mem() const;
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
