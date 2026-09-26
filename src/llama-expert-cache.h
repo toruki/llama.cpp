@@ -18,7 +18,7 @@ struct llama_model;
 
 struct llama_expert_cache {
     // slots: number of (layer, expert) triples resident on the device
-    llama_expert_cache(const llama_model & model, ggml_backend_dev_t dev, uint32_t slots);
+    llama_expert_cache(const llama_model & model, ggml_backend_dev_t dev, ggml_backend_t backend, uint32_t slots);
     ~llama_expert_cache();
 
     // true when this layer's routed experts are served from the cache (host tensors match the banks)
@@ -74,8 +74,10 @@ private:
     int64_t hits = 0, misses = 0;
     size_t  bytes_h2d = 0;
 
+    ggml_backend_t backend = nullptr;      // device backend (async copies), may be null
     ggml_backend_buffer_ptr staging_buf;   // optional page-locked staging for the misses
     uint8_t * staging = nullptr;
+    int staging_n = 0;                     // experts the staging area holds
 
     std::vector<void *> pinned_ranges;
     void (*unreg_fn)(void *) = nullptr;
