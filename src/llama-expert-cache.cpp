@@ -96,6 +96,29 @@ llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_d
         free_slots.push_back(s);
     }
 
+    // LLAMA_EXPERT_CACHE_PIN=1: page-lock the host expert tensors so the misses are copied by DMA at
+    // full PCIe speed instead of the driver's staged pageable copies (pins ~45 GiB of page cache)
+    if (const char * env = getenv("LLAMA_EXPERT_CACHE_PIN"); env && atoi(env) > 0) {
+        auto * reg_fn = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_register_host_buffer");
+        unreg_fn = (void (*)(void *)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), "ggml_backend_unregister_host_buffer");
+        if (!reg_fn || !unreg_fn) {
+            LLAMA_LOG_WARN("%s: device cannot register host memory, not pinning\n", __func__);
+        } else {
+            size_t pinned = 0; int failed = 0;
+            const size_t page = 4096;
+            for (int il = 0; il < n_layer; ++il) {
+                const auto & src = per_layer[il];
+                if (!src.gate) continue;
+                for (const ggml_tensor * t : {src.gate, src.up, src.down}) {
+                    const uintptr_t b = (uintptr_t) t->data & ~(uintptr_t) (page - 1);
+                    const uintptr_t e = ((uintptr_t) t->data + ggml_nbytes(t) + page - 1) & ~(uintptr_t) (page - 1);
+                    if (reg_fn((void *) b, e - b)) { pinned_ranges.push_back((void *) b); pinned += e - b; } else { failed++; }
+                }
+            }
+            LLAMA_LOG_INFO("%s: pinned %.1f GiB of host expert memory (%d ranges failed)\n", __func__, pinned / (1024.0 * 1024.0 * 1024.0), failed);
+        }
+    }
+
     const double slot_mib = (double) (g0->nb[2] + u0->nb[2] + d0->nb[2]) / (1024.0 * 1024.0);
     LLAMA_LOG_INFO("%s: %u slots x %.3f MiB = %.2f GiB on %s, %d/%d layers cached (%.1f%% of their experts resident)\n",
             __func__, slots, slot_mib, ggml_backend_buffer_get_size(bank_buf.get()) / (1024.0 * 1024.0 * 1024.0),
@@ -103,6 +126,9 @@ llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_d
 }
 
 llama_expert_cache::~llama_expert_cache() {
+    if (unreg_fn) {
+        for (void * p : pinned_ranges) unreg_fn(p);
+    }
     const int64_t total = hits + misses;
     if (total > 0) {
         LLAMA_LOG_INFO("%s: expert cache: %lld lookups, hit %.2f%%, %.2f MiB transferred per miss avg, %.1f GiB total\n",

@@ -73,4 +73,7 @@ private:
 
     int64_t hits = 0, misses = 0;
     size_t  bytes_h2d = 0;
+
+    std::vector<void *> pinned_ranges;
+    void (*unreg_fn)(void *) = nullptr;
 };
