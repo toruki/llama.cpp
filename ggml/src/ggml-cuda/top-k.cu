@@ -12,6 +12,30 @@ using namespace cub;
 
 #ifdef CUB_TOP_K_AVAILABLE
 
+// Ties are broken by the lower index, so the selected set is a deterministic function of the input.
+// (DeviceTopK on the raw floats picks arbitrarily among equal values, which changes run to run: the
+// qwen4exp sparse attention expands one score to every cell of a block, so its cut-off is a tie 3 times in 4.)
+// Each value is packed with its index into one 64-bit key: the order-preserving image of the float in
+// the high word and the bitwise-complemented index in the low word, so a lower index makes a larger key.
+static __device__ __forceinline__ uint32_t top_k_ordered_bits(float f) {
+    const uint32_t u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+static __global__ void top_k_pack_keys(const float * __restrict__ src, unsigned long long * __restrict__ keys, const int ncols) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < ncols) {
+        keys[i] = ((unsigned long long) top_k_ordered_bits(src[i]) << 32) | (unsigned long long) (~(uint32_t) i);
+    }
+}
+
+static __global__ void top_k_unpack_keys(const unsigned long long * __restrict__ keys, int * __restrict__ dst, const int k) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < k) {
+        dst[i] = (int) ~(uint32_t) (keys[i] & 0xFFFFFFFFull);
+    }
+}
+
 static void top_k_cub(ggml_cuda_pool & pool,
                       const float *    src,
                       int *            dst,
@@ -23,17 +47,21 @@ static void top_k_cub(ggml_cuda_pool & pool,
     auto stream_env   = cuda::stream_ref{ stream };
     auto env          = cuda::std::execution::env{ stream_env, requirements };
 
-    auto indexes_in = cuda::make_counting_iterator(0);
+    ggml_cuda_pool_alloc<unsigned long long> keys_alloc(pool, ncols + k);
+    unsigned long long * keys_in  = keys_alloc.get();
+    unsigned long long * keys_out = keys_in + ncols;
+
+    top_k_pack_keys<<<(ncols + 255)/256, 256, 0, stream>>>(src, keys_in, ncols);
 
     size_t temp_storage_bytes = 0;
-    CUDA_CHECK(DeviceTopK::MaxPairs(nullptr, temp_storage_bytes, src, cuda::discard_iterator(), indexes_in, dst, ncols, k,
-                         env));
+    CUDA_CHECK(DeviceTopK::MaxKeys(nullptr, temp_storage_bytes, keys_in, keys_out, ncols, k, env));
 
     ggml_cuda_pool_alloc<uint8_t> temp_storage_alloc(pool, temp_storage_bytes);
     void *                        d_temp_storage = temp_storage_alloc.get();
 
-    CUDA_CHECK(DeviceTopK::MaxPairs(d_temp_storage, temp_storage_bytes, src, cuda::discard_iterator(), indexes_in, dst,
-                         ncols, k, env));
+    CUDA_CHECK(DeviceTopK::MaxKeys(d_temp_storage, temp_storage_bytes, keys_in, keys_out, ncols, k, env));
+
+    top_k_unpack_keys<<<(k + 255)/256, 256, 0, stream>>>(keys_out, dst, k);
 }
 
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
