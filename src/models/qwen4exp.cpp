@@ -1152,10 +1152,16 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
+        if (emb != nullptr) {
+            return emb->ne[1] == params.ubatch.n_tokens;
+        }
         return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
+    // either the row ids for a graph-side ggml_get_rows, or the gathered rows themselves: the table is
+    // host memory (27.5 GiB mmap), so gathering here keeps the decode graph free of a CPU split
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim * ple_n_heads, n_tokens]
 
     const llama_model_qwen4exp & pmodel;
 
@@ -1164,6 +1170,7 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+    std::vector<float>       gathered;
 };
 
 void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
@@ -1226,7 +1233,33 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    if (emb == nullptr) {
+        ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+        return;
+    }
+
+    // gather the rows on the host, converting to F32 as the CPU get_rows would
+    const ggml_tensor * table = pmodel.per_layer_tok_embd;
+    GGML_ASSERT(ggml_backend_buffer_is_host(table->buffer));
+    GGML_ASSERT(table->ne[0] == (int64_t) hp.ple_head_dim);
+
+    const int64_t ne0 = table->ne[0];
+    const size_t  row_bytes = ggml_row_size(table->type, ne0);
+    const auto *  tt = ggml_get_type_traits(table->type);
+
+    gathered.resize(idx.size()*ne0);
+    for (size_t r = 0; r < idx.size(); ++r) {
+        const char * src = (const char *) table->data + (size_t) idx[r]*row_bytes;
+        float * dst = gathered.data() + r*ne0;
+        if (table->type == GGML_TYPE_F32) {
+            memcpy(dst, src, row_bytes);
+        } else {
+            GGML_ASSERT(tt->to_float != nullptr);
+            tt->to_float(src, dst, ne0);
+        }
+    }
+
+    ggml_backend_tensor_set(emb, gathered.data(), 0, gathered.size()*sizeof(float));
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1293,14 +1326,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
             static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
-    ggml_set_input(ple_inp->rows);
-    ggml_tensor * rows = ple_inp->rows;
-    res->add_input(std::move(ple_inp));
+    ggml_tensor * emb = nullptr;
 
-    // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
-    emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+    static const bool host_gather = [] { const char * e = getenv("LLAMA_PLE_HOST_GATHER"); return e == nullptr || atoi(e) != 0; }();
+
+    if (host_gather && ggml_backend_buffer_is_host(model.per_layer_tok_embd->buffer)) {
+        // the table stays in host memory: set_input gathers the rows, so no CPU op is left in the graph
+        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim * n_heads, n_tokens);
+        ggml_set_input(ple_inp->emb);
+        emb = ple_inp->emb;
+        res->add_input(std::move(ple_inp));
+    } else {
+        ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+        ggml_set_input(ple_inp->rows);
+        ggml_tensor * rows = ple_inp->rows;
+        res->add_input(std::move(ple_inp));
+
+        // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
+        emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+        emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
+    }
     cb(emb, "ple_embd", -1);
 
     return emb;
