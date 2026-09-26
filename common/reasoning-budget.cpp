@@ -133,6 +133,13 @@ static void common_reasoning_budget_accept(struct llama_sampler * smpl, llama_to
         }
         case REASONING_BUDGET_FORCING:
         {
+            // only the forced token advances the sequence: apply() pins the sampled token to it, but the
+            // prefill tokens accepted at init (a template that opens the thinking block itself, e.g.
+            // "<think>\n" with a budget of 0) are not part of the sequence and must not consume it
+            if (ctx->force_pos < ctx->forced_tokens.size() && token != ctx->forced_tokens[ctx->force_pos]) {
+                COM_TRC("ignoring token %d while forcing (expected %d)\n", token, ctx->forced_tokens[ctx->force_pos]);
+                break;
+            }
             // track the end sequence within forced_tokens so it is also reported on DONE
             const int32_t match = ctx->end_matcher.advance(token);
             ctx->force_pos++;
