@@ -101,6 +101,34 @@ static __global__ void k_get_rows_float(
     }
 }
 
+// rows of a single element (the qwen4exp indexer expands one score per cell for a single-token decode):
+// one thread per output element instead of one block per row
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_float_scalar(
+        const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
+        const int64_t ne10, const int64_t ne11, const uint3 ne12_fdv,
+        const size_t s1, const size_t s2, const size_t s3,
+        const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+
+    ggml_cuda_pdl_lc();
+    const src0_t  * GGML_CUDA_RESTRICT src0 = src0_ptr;
+    const int32_t * GGML_CUDA_RESTRICT src1 = src1_ptr;
+    dst_t         * GGML_CUDA_RESTRICT dst  = dst_ptr;
+    ggml_cuda_pdl_sync();
+    const int64_t n = ne10*ne11*(int64_t)ne12_fdv.z;
+    for (int64_t i = blockIdx.x*(int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x*blockDim.x) {
+        const int   i10 = (int) (i % ne10);
+        const uint2 dm  = fast_div_modulo((uint32_t) (i / ne10), ne12_fdv);
+        const int   i11 = dm.x;
+        const int   i12 = dm.y;
+
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+
+        dst[i10*s1 + i11*s2 + i12*s3] = ggml_cuda_cast<dst_t>(*(const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03));
+    }
+}
+
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
@@ -277,6 +305,19 @@ static void get_rows_cuda_float(
                 s10, s11, s12);
             return;
         }
+    }
+
+    if (ne00 == 1) {
+        const int64_t n = ne10*ne11*ne12;
+        const dim3 block_nums(MIN((n + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE, (int64_t) 65535), 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
+        ggml_cuda_kernel_launch(k_get_rows_float_scalar<src0_t, dst_t>, launch_params,
+            src0_d, src1_d, dst_d,
+            ne10, ne11, ne12_fdv,
+            s1, s2, s3,
+            nb01, nb02, nb03,
+            s10, s11, s12);
+        return;
     }
 
     const int block_num_y = (ne00 + CUDA_GET_ROWS_BLOCK_SIZE - 1) / CUDA_GET_ROWS_BLOCK_SIZE;
