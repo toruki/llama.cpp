@@ -731,6 +731,50 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
+    // Single-token decode: attend to the selected cells only. The masked path below hands the
+    // full-length K/V to flash attention and hides the unselected cells with -inf, so its cost
+    // grows with the context (6 GiB of KV per QSA layer at 256k). Gathering the ~2k selected
+    // rows first keeps the attention itself O(top_k). Padded to a multiple of 256 with masked
+    // rows so the FA kernels see the KV length they are tuned for.
+    static const bool qsa_gather = [] { const char * e = getenv("LLAMA_QSA_GATHER"); return e == nullptr || atoi(e) != 0; }();
+    if (qsa_gather && n_tokens == 1 && top_k->ne[3] == 1 && cparams.flash_attn && kq_mask->type == GGML_TYPE_F16) {
+        ggml_tensor * k_cache = mctx_cur->get_k(ctx0, il);   // [hd, n_head_kv, n_kv, 1]
+        ggml_tensor * v_cache = mctx_cur->get_v(ctx0, il);
+        const bool v_trans = v_cache->nb[1] > v_cache->nb[2];
+        if (!v_trans && kq_mask->ne[0] == k_cache->ne[2] && kq_mask->ne[1] == 1) {
+            const int64_t width     = top_k->ne[0];
+            const int64_t width_pad = GGML_PAD(width, 256);
+            const int64_t n_kv      = k_cache->ne[2];
+
+            ggml_tensor * ids = ggml_reshape_1d(ctx0, top_k, width);
+            // mask values of the selected cells (future cells can be selected when fewer than width are visible)
+            ggml_tensor * m2 = ggml_view_2d(ctx0, kq_mask, 1, n_kv, kq_mask->nb[0], 0);
+            ggml_tensor * m_sel = ggml_get_rows(ctx0, m2, ids);                  // F32 [1, width]
+            if (width_pad != width) {
+                ggml_tensor * pad_ids = ggml_cast(ctx0, ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, width_pad - width), 0.0f), GGML_TYPE_I32);
+                ids = ggml_concat(ctx0, ids, pad_ids, 0);
+                ggml_tensor * pad_m = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, width_pad - width), -INFINITY);
+                m_sel = ggml_concat(ctx0, m_sel, pad_m, 1);
+            }
+            ggml_tensor * mask_sel = ggml_cast(ctx0, ggml_reshape_4d(ctx0, m_sel, width_pad, 1, 1, 1), GGML_TYPE_F16);
+
+            ggml_tensor * k2 = ggml_view_2d(ctx0, k_cache, k_cache->ne[0]*k_cache->ne[1], n_kv, k_cache->nb[2], 0);
+            ggml_tensor * v2 = ggml_view_2d(ctx0, v_cache, v_cache->ne[0]*v_cache->ne[1], n_kv, v_cache->nb[2], 0);
+            ggml_tensor * k_sel = ggml_cast(ctx0, ggml_get_rows(ctx0, k2, ids), GGML_TYPE_F16);
+            ggml_tensor * v_sel = ggml_cast(ctx0, ggml_get_rows(ctx0, v2, ids), GGML_TYPE_F16);
+            k_sel = ggml_reshape_4d(ctx0, k_sel, k_cache->ne[0], k_cache->ne[1], width_pad, 1);
+            v_sel = ggml_reshape_4d(ctx0, v_sel, v_cache->ne[0], v_cache->ne[1], width_pad, 1);
+            cb(k_sel, "qsa_k_sel", il);
+
+            ggml_tensor * cur = build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask_sel, nullptr, nullptr, kq_scale, il);
+            cb(cur, "kqv_out", il);
+            if (inp->self_v_rot) {
+                cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+            }
+            return cur;
+        }
+    }
+
     // prepare new kq mask - starts filled with -INFINITY
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
 
