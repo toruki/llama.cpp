@@ -1406,13 +1406,20 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// LLAMA_DECODE_PROFILE=1: mean time of the process_ubatch phases for single-token ubatches, printed every 200 calls
+static struct { bool on = getenv("LLAMA_DECODE_PROFILE") != nullptr; int n = 0; double t[5] = {}; } g_dprof;
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const bool prof = g_dprof.on && ubatch.n_tokens == 1;
+    int64_t tp0 = prof ? ggml_time_us() : 0;
+    auto lap = [&](int i) { if (prof) { const int64_t t = ggml_time_us(); g_dprof.t[i] += (t - tp0) / 1000.0; tp0 = t; } };
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
 
+    lap(0);
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1459,6 +1466,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    lap(1);
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1468,8 +1476,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    lap(2);
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    lap(3);
+    if (prof) {
+        ggml_backend_sched_synchronize(sched.get());
+        lap(4);
+        if (++g_dprof.n % 200 == 0) {
+            LLAMA_LOG_INFO("decode profile (mean ms over %d single-token ubatches): memory apply %.2f | graph reuse/build+alloc %.2f | set_inputs %.2f | compute launch %.2f | wait for device %.2f\n",
+                    g_dprof.n, g_dprof.t[0] / g_dprof.n, g_dprof.t[1] / g_dprof.n, g_dprof.t[2] / g_dprof.n, g_dprof.t[3] / g_dprof.n, g_dprof.t[4] / g_dprof.n);
+        }
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
