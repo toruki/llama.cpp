@@ -246,6 +246,11 @@ public:
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // every edit of the cells (clear, seq_rm/cp/keep/add/div, state restore) bumps this, so derived caches
+    // (the qwen4exp pooled indexer keys) can tell when their layout must be rebuilt
+    uint64_t edit_gen = 1;
+    uint64_t get_edit_gen() const { return edit_gen; }
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
