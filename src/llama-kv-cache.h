@@ -267,16 +267,27 @@ public:
     static constexpr size_t RECENT_TOK_CAP = 256;
     std::vector<recent_tok> recent_toks;
     size_t recent_next = 0;
-    void recent_clear() { recent_toks.clear(); recent_next = 0; }
+    // every edit of the cells (the recent_clear() sites) bumps this, so derived caches can tell when to rebuild
+    uint64_t edit_gen = 1;
+    uint64_t get_edit_gen() const { return edit_gen; }
+    void recent_clear() { recent_toks.clear(); recent_next = 0; edit_gen++; }
     void recent_push(llama_seq_id seq, llama_pos pos, llama_token tok) {
+        if (apply_speculative) { return; }   // prepare() places and then takes the ubatch back
         if (recent_toks.size() < RECENT_TOK_CAP) { recent_toks.push_back({seq, pos, tok}); }
         else { recent_toks[recent_next] = {seq, pos, tok}; recent_next = (recent_next + 1) % RECENT_TOK_CAP; }
     }
-    // pos-s predecessors of (seq, pos) from the ring; false if any is not there
+    // the token at (seq, pos) from the ring, newest entry first; false if it is not there
     bool recent_lookup(llama_seq_id seq, llama_pos pos, llama_token & tok) const {
-        for (const auto & r : recent_toks) { if (r.seq == seq && r.pos == pos) { tok = r.tok; return true; } }
+        const size_t n = recent_toks.size();
+        for (size_t k = 0; k < n; ++k) {
+            // the newest entry is just before recent_next once the ring has wrapped, else the last one
+            const size_t i = n < RECENT_TOK_CAP ? n - 1 - k : (recent_next + RECENT_TOK_CAP - 1 - k) % RECENT_TOK_CAP;
+            const auto & r = recent_toks[i];
+            if (r.seq == seq && r.pos == pos) { tok = r.tok; return true; }
+        }
         return false;
     }
+    bool apply_speculative = false;
 
 private:
     const llama_model & model;

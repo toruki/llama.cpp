@@ -798,8 +798,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
             states.push_back(std::move(state));
         }
 
-        // now emplace the ubatch
+        // now emplace the ubatch (taken back below, so it must not reach the recent-token ring)
+        apply_speculative = true;
         apply_ubatch(sinfo_new, ubatch);
+        apply_speculative = false;
     }
 
     GGML_ASSERT(!states.empty() || !success);
