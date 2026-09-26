@@ -601,6 +601,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_EXPERT_CACHE,
+
         GGML_OP_COUNT,
     };
 
@@ -2459,6 +2461,16 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // device-side MoE expert cache (see ggml-cuda/expert-cache.cu): maps the router's expert ids
+    // [k, n_tokens] (I32) to slot ids in the cache banks, loading the missing experts from host
+    // memory on the device. `desc` is the device descriptor created by the backend, `layer` the
+    // transformer layer whose experts are looked up.
+    GGML_API struct ggml_tensor * ggml_expert_cache(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            void                * desc,
+            int                   layer);
 
     // top k elements per row
     // note: the resulting top k indices are in no particular order

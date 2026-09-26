@@ -736,7 +736,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // grows with the context (6 GiB of KV per QSA layer at 256k). Gathering the ~2k selected
     // rows first keeps the attention itself O(top_k). Padded to a multiple of 256 with masked
     // rows so the FA kernels see the KV length they are tuned for.
-    static const bool qsa_gather = [] { const char * e = getenv("LLAMA_QSA_GATHER"); return e == nullptr || atoi(e) != 0; }();
+    // off by default: the gathered row order follows top-k, which is not stable run to run, and the
+    // resulting attention rounding differences are amplified by the MoE routing downstream
+    static const bool qsa_gather = [] { const char * e = getenv("LLAMA_QSA_GATHER"); return e != nullptr && atoi(e) != 0; }();
     if (qsa_gather && n_tokens == 1 && top_k->ne[3] == 1 && cparams.flash_attn && kq_mask->type == GGML_TYPE_F16) {
         ggml_tensor * k_cache = mctx_cur->get_k(ctx0, il);   // [hd, n_head_kv, n_kv, 1]
         ggml_tensor * v_cache = mctx_cur->get_v(ctx0, il);

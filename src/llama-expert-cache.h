@@ -31,6 +31,9 @@ struct llama_expert_cache {
     // userdata for the prepare op of layer il (valid for the cache's lifetime)
     void * userdata(int il) { return &per_layer[il]; }
 
+    // device-side cache (GGML_OP_EXPERT_CACHE): the descriptor to pass to ggml_expert_cache(), or null
+    void * device_desc() const { return dev_desc; }
+
     // ggml_custom1_op_t: dst/a are I32 [k, n_tokens]; a = original expert ids, dst = slot ids
     static void prepare_op(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
     // ggml_custom1_op_t used during prefill: counts the routed experts (dst = a) so that the first
@@ -88,9 +91,16 @@ private:
     int  first_covered = -1;
 
     ggml_backend_t backend = nullptr;      // device backend (async copies), may be null
+    ggml_backend_dev_t dev_ = nullptr;
     ggml_backend_buffer_ptr staging_buf;   // optional page-locked staging for the misses
     uint8_t * staging = nullptr;
     int staging_n = 0;                     // experts the staging area holds
+
+    // device-side cache handle + API (resolved through the backend registry, null when unavailable)
+    void * dev_handle = nullptr;
+    void * dev_desc   = nullptr;
+    void (*dev_free_fn)(void *) = nullptr;
+    void (*dev_stats_fn)(void *, int64_t *, int64_t *) = nullptr;
 
     std::vector<void *> pinned_ranges;
     void (*unreg_fn)(void *) = nullptr;

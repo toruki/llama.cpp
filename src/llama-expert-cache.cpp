@@ -12,7 +12,7 @@
 #include <stdexcept>
 
 llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_dev_t dev, ggml_backend_t backend_, uint32_t slots_)
-    : slots(slots_), n_layer((int) model.hparams.n_layer()), n_expert((int) model.hparams.n_expert), backend(backend_) {
+    : slots(slots_), n_layer((int) model.hparams.n_layer()), n_expert((int) model.hparams.n_expert), backend(backend_), dev_(dev) {
     if (slots < 2 * model.hparams.n_expert_used) {
         throw std::runtime_error("expert cache: too few slots");
     }
@@ -142,6 +142,43 @@ llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_d
         }
     }
 
+    // device-side cache (default when the backend provides it; LLAMA_EXPERT_CACHE_DEVICE=0 keeps the host LRU)
+    {
+        const char * env = getenv("LLAMA_EXPERT_CACHE_DEVICE");
+        const bool want = env == nullptr || atoi(env) != 0;
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        auto * create_fn = (void * (*)(const void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_ecache_create");
+        auto * desc_fn   = (void * (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_ecache_desc");
+        dev_free_fn  = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_ecache_free");
+        dev_stats_fn = (void (*)(void *, int64_t *, int64_t *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_ecache_stats");
+        if (want && create_fn && desc_fn && dev_free_fn && dev_stats_fn) {
+            struct params_t {   // mirrors ggml_cuda_ecache_params (kept here to avoid including the CUDA header)
+                int32_t n_layer, n_expert, n_expert_used, slots;
+                const void * const * host_src; const size_t * host_bytes;
+                void * bank[3]; size_t nb[3];
+            } prm;
+            std::vector<const void *> hs((size_t) n_layer * 3, nullptr);
+            std::vector<size_t> hb((size_t) n_layer * 3, 0);
+            for (int il = 0; il < n_layer; ++il) {
+                const auto & src = per_layer[il];
+                if (!src.gate) continue;
+                const ggml_tensor * ts[3] = {src.gate, src.up, src.down};
+                for (int t = 0; t < 3; ++t) { hs[(size_t) il * 3 + t] = ts[t]->data; hb[(size_t) il * 3 + t] = ggml_nbytes(ts[t]); }
+            }
+            prm.n_layer = n_layer; prm.n_expert = n_expert; prm.n_expert_used = (int32_t) model.hparams.n_expert_used; prm.slots = (int32_t) slots;
+            prm.host_src = hs.data(); prm.host_bytes = hb.data();
+            prm.bank[0] = t_gate->data; prm.bank[1] = t_up->data; prm.bank[2] = t_down->data;
+            prm.nb[0] = t_gate->nb[2]; prm.nb[1] = t_up->nb[2]; prm.nb[2] = t_down->nb[2];
+            dev_handle = create_fn(&prm);
+            if (dev_handle) {
+                dev_desc = desc_fn(dev_handle);
+                LLAMA_LOG_INFO("%s: device-side lookup and fill enabled (GGML_OP_EXPERT_CACHE)\n", __func__);
+            } else {
+                LLAMA_LOG_WARN("%s: device-side cache unavailable, using the host LRU\n", __func__);
+            }
+        }
+    }
+
     const double slot_mib = (double) (g0->nb[2] + u0->nb[2] + d0->nb[2]) / (1024.0 * 1024.0);
     LLAMA_LOG_INFO("%s: %u slots x %.3f MiB = %.2f GiB on %s, %d/%d layers cached (%.1f%% of their experts resident)\n",
             __func__, slots, slot_mib, ggml_backend_buffer_get_size(bank_buf.get()) / (1024.0 * 1024.0 * 1024.0),
@@ -149,6 +186,18 @@ llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_d
 }
 
 llama_expert_cache::~llama_expert_cache() {
+    if (dev_handle) {
+        if (const char * env = getenv("LLAMA_EXPERT_CACHE_VERIFY"); env && atoi(env) > 0) {
+            auto * verify_fn = (int (*)(void *, int)) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev_), "ggml_backend_cuda_ecache_verify");
+            if (verify_fn) verify_fn(dev_handle, atoi(env));
+        }
+        int64_t h = 0, m = 0;
+        dev_stats_fn(dev_handle, &h, &m);
+        if (h + m > 0) {
+            LLAMA_LOG_INFO("%s: device expert cache: %lld lookups, hit %.2f%%\n", __func__, (long long) (h + m), 100.0 * h / (h + m));
+        }
+        dev_free_fn(dev_handle);
+    }
     if (unreg_fn) {
         for (void * p : pinned_ranges) unreg_fn(p);
     }

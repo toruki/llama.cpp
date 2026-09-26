@@ -9,6 +9,7 @@
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
+#include "ggml-cuda/expert-cache.cuh"
 #include "ggml-cuda/binbcast.cuh"
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
@@ -2360,6 +2361,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
+            break;
+        case GGML_OP_EXPERT_CACHE:
+            ggml_cuda_op_expert_cache(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
@@ -5545,6 +5549,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
         case GGML_OP_SUM:
             return ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_EXPERT_CACHE:
+            return op->src[0]->type == GGML_TYPE_I32;
         case GGML_OP_TOP_K:
 #if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
             return true;
@@ -5771,6 +5777,21 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_cuda_ecache_create") == 0) {
+        return (void *)ggml_backend_cuda_ecache_create;
+    }
+    if (strcmp(name, "ggml_backend_cuda_ecache_free") == 0) {
+        return (void *)ggml_backend_cuda_ecache_free;
+    }
+    if (strcmp(name, "ggml_backend_cuda_ecache_stats") == 0) {
+        return (void *)ggml_backend_cuda_ecache_stats;
+    }
+    if (strcmp(name, "ggml_backend_cuda_ecache_desc") == 0) {
+        return (void *)ggml_backend_cuda_ecache_desc;
+    }
+    if (strcmp(name, "ggml_backend_cuda_ecache_verify") == 0) {
+        return (void *)ggml_backend_cuda_ecache_verify;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;

@@ -2186,7 +2186,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (ecache && !cparams.warmup && n_tokens == 1 && !gate_up_exps && !up_exps_s && !gate_exps_s && !down_exps_s &&
             !up_exps_b && !gate_exps_b && !down_exps_b && ecache->covers(il, up_exps, gate_exps, down_exps)) {
         ggml_tensor * ids_c = ggml_cont(ctx0, selected_experts);   // I32 [n_expert_used, n_tokens], contiguous
-        ids_mm = ggml_map_custom1(ctx0, ids_c, llama_expert_cache::prepare_op, 1, ecache->userdata(il));
+        if (ecache->device_desc()) {
+            ids_mm = ggml_expert_cache(ctx0, ids_c, ecache->device_desc(), il);   // lookup + fill on the device
+        } else {
+            ids_mm = ggml_map_custom1(ctx0, ids_c, llama_expert_cache::prepare_op, 1, ecache->userdata(il));
+        }
         cb(ids_mm, "ffn_moe_cache_ids", il);
         up_w = ecache->bank_up(); gate_w = ecache->bank_gate(); down_w = ecache->bank_down();
     } else if (ecache && ecache->warm_on() && !cparams.warmup && n_tokens > 1 && ecache->covers(il, up_exps, gate_exps, down_exps)) {
