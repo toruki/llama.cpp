@@ -38,6 +38,26 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char 
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
 
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
+
+// device-side MoE expert cache (ggml-cuda/expert-cache.cu). Also reachable through
+// ggml_backend_reg_get_proc_address("ggml_backend_cuda_ecache_*") so that llama does not link CUDA.
+struct ggml_cuda_ecache_params {
+    int32_t n_layer;
+    int32_t n_expert;
+    int32_t n_expert_used;          // k: experts per token
+    int32_t slots;                  // total slots in the banks
+    const void * const * host_src;  // [n_layer*3] host pointers to the expert tensors (gate, up, down), NULL = layer not cached
+    const size_t * host_bytes;      // [n_layer*3] bytes of each host tensor (for page-locking)
+    void * bank[3];                 // device bank base pointers (gate, up, down)
+    size_t nb[3];                   // bytes per expert in each bank
+};
+GGML_BACKEND_API void * ggml_backend_cuda_ecache_create(const struct ggml_cuda_ecache_params * params);
+GGML_BACKEND_API void   ggml_backend_cuda_ecache_free(void * desc);
+// hits, misses since creation (synchronizes the device)
+GGML_BACKEND_API void   ggml_backend_cuda_ecache_stats(void * desc, int64_t * hits, int64_t * misses);
+// the device descriptor to pass to ggml_expert_cache()
+GGML_BACKEND_API void * ggml_backend_cuda_ecache_desc(void * handle);
+GGML_BACKEND_API int    ggml_backend_cuda_ecache_verify(void * handle, int max_check);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);

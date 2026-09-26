@@ -1130,9 +1130,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "EXPERT_CACHE",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1245,9 +1247,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "expert_cache(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5426,6 +5430,29 @@ struct ggml_tensor * ggml_argsort_top_k(
 }
 
 // ggml_top_k
+
+// ggml_expert_cache
+
+struct ggml_tensor * ggml_expert_cache(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        void                * desc,
+        int                   layer) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(ids));
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, ids->ne[0], ids->ne[1], ids->ne[2], ids->ne[3]);
+
+    // op params: the descriptor pointer (two 32-bit words) and the layer
+    int32_t params[4] = { 0, 0, layer, 0 };
+    memcpy(params, &desc, sizeof(desc));
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_EXPERT_CACHE;
+    result->src[0] = ids;
+
+    return result;
+}
 
 struct ggml_tensor * ggml_top_k(
         struct ggml_context * ctx,
