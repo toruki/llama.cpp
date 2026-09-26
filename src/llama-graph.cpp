@@ -1,6 +1,10 @@
 #include "llama-graph.h"
 #include "llama-expert-cache.h"
 
+#include <map>
+#include <string>
+#include <typeinfo>
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1378,8 +1382,19 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    // LLAMA_DECODE_PROFILE=1: per-input mean time for single-token ubatches, printed every 200 calls
+    static const bool prof = getenv("LLAMA_DECODE_PROFILE") != nullptr;
+    static std::map<std::string, double> acc; static int n_calls = 0;
+    const bool p = prof && ubatch->n_tokens == 1;
     for (auto & input : inputs) {
+        const int64_t t0 = p ? ggml_time_us() : 0;
         input->set_input(ubatch);
+        if (p) acc[typeid(*input).name()] += (ggml_time_us() - t0) / 1000.0;
+    }
+    if (p && ++n_calls % 200 == 0) {
+        std::string line;
+        for (const auto & kv : acc) { char b[160]; snprintf(b, sizeof(b), " %s=%.2f", kv.first.c_str(), kv.second / n_calls); line += b; }
+        LLAMA_LOG_INFO("set_inputs profile (mean ms):%s\n", line.c_str());
     }
 }
 

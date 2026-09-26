@@ -371,6 +371,7 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    recent_clear();
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -384,6 +385,7 @@ void llama_kv_cache::clear(bool data) {
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    recent_clear();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return true;
@@ -453,6 +455,7 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    recent_clear();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -545,6 +548,7 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+    recent_clear();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -572,6 +576,7 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    recent_clear();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -622,6 +627,7 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    recent_clear();
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
         return;
@@ -1153,6 +1159,10 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
                 }
 
                 cells.ext_set(idx, ext);
+                // text tokens only (an image arrives as an embd batch and repeats one position)
+                if (ubatch.n_seq_id[i] == 1 && ubatch.token) {
+                    recent_push(ubatch.seq_id[i][0], ubatch.pos[i], ext.tok);
+                }
             }
 
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; s++) {
@@ -2033,6 +2043,25 @@ void llama_kv_cache::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, st
         return;
     }
 
+    // fast path: a text ubatch whose predecessors are all among the recently stored tokens
+    if (ubatch.token && !recent_toks.empty()) {
+        bool ok = true;
+        for (uint32_t i = 0; i < n_tokens && ok; ++i) {
+            if (ubatch.n_seq_id[i] != 1) { ok = false; break; }
+            const llama_seq_id seq = ubatch.seq_id[i][0];
+            for (uint32_t s = 1; s <= n; ++s) {
+                const llama_pos p = ubatch.pos[i] - (llama_pos) s;
+                llama_token tok = LLAMA_TOKEN_NULL;
+                if (p >= 0 && !recent_lookup(seq, p, tok)) { ok = false; break; }
+                res[i*n + (n - s)] = tok;
+            }
+        }
+        if (ok) {
+            return;
+        }
+        std::fill(res.begin(), res.end(), LLAMA_TOKEN_NULL);
+    }
+
     // note: apply_ubatch() has already stored the current ubatch
     //       the window below thus covers tokens of this very ubatch as well, which is what we want
     llama_pos p_min = std::numeric_limits<llama_pos>::max();
@@ -2744,6 +2773,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 }
 
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+    recent_clear();
     auto & cells = v_cells[strm];
 
     uint32_t v_trans;

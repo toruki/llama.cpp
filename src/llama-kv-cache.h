@@ -260,6 +260,24 @@ public:
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
 
+    // the most recently stored (seq, pos, token) triples, so that get_prev_tokens() does not have to
+    // scan every cell for a decode token's predecessors (O(n_kv) per token). Cleared on any edit of
+    // the cells, after which get_prev_tokens() falls back to the full scan.
+    struct recent_tok { llama_seq_id seq; llama_pos pos; llama_token tok; };
+    static constexpr size_t RECENT_TOK_CAP = 256;
+    std::vector<recent_tok> recent_toks;
+    size_t recent_next = 0;
+    void recent_clear() { recent_toks.clear(); recent_next = 0; }
+    void recent_push(llama_seq_id seq, llama_pos pos, llama_token tok) {
+        if (recent_toks.size() < RECENT_TOK_CAP) { recent_toks.push_back({seq, pos, tok}); }
+        else { recent_toks[recent_next] = {seq, pos, tok}; recent_next = (recent_next + 1) % RECENT_TOK_CAP; }
+    }
+    // pos-s predecessors of (seq, pos) from the ring; false if any is not there
+    bool recent_lookup(llama_seq_id seq, llama_pos pos, llama_token & tok) const {
+        for (const auto & r : recent_toks) { if (r.seq == seq && r.pos == pos) { tok = r.tok; return true; } }
+        return false;
+    }
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
