@@ -10,8 +10,8 @@
 #include <cstring>
 #include <stdexcept>
 
-llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_dev_t dev, uint32_t slots_)
-    : slots(slots_), n_layer((int) model.hparams.n_layer()), n_expert((int) model.hparams.n_expert) {
+llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_dev_t dev, ggml_backend_t backend_, uint32_t slots_)
+    : slots(slots_), n_layer((int) model.hparams.n_layer()), n_expert((int) model.hparams.n_expert), backend(backend_) {
     if (slots < 2 * model.hparams.n_expert_used) {
         throw std::runtime_error("expert cache: too few slots");
     }
@@ -123,13 +123,15 @@ llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_d
     // device transfer is a single DMA instead of the driver's chunked pageable copy
     if (const char * env = getenv("LLAMA_EXPERT_CACHE_STAGING"); env && atoi(env) > 0) {
         ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(dev);
-        const size_t need = g0->nb[2] + u0->nb[2] + d0->nb[2];
+        staging_n = (int) model.hparams.n_expert_used;                 // misses of one token, copied asynchronously
+        const size_t need = (size_t) staging_n * (g0->nb[2] + u0->nb[2] + d0->nb[2]);
         if (hbuft) {
             staging_buf.reset(ggml_backend_buft_alloc_buffer(hbuft, need));
         }
         if (staging_buf) {
             staging = (uint8_t *) ggml_backend_buffer_get_base(staging_buf.get());
-            LLAMA_LOG_INFO("%s: staging misses through %.2f MiB of page-locked host memory\n", __func__, need / (1024.0 * 1024.0));
+            LLAMA_LOG_INFO("%s: staging misses through %.1f MiB of page-locked host memory (%s copies)\n", __func__,
+                    need / (1024.0 * 1024.0), backend ? "async" : "sync");
         } else {
             LLAMA_LOG_WARN("%s: no page-locked host buffer type, staging disabled\n", __func__);
         }
@@ -216,28 +218,45 @@ void llama_expert_cache::prepare(int il, const int32_t * ids, int64_t k, int64_t
                 miss_e.push_back((int32_t) j); orow[j] = -1;
             }
         }
+        const size_t nbu = src.up->nb[2], nbd = src.down->nb[2];
+        int n_inflight = 0;
         for (int32_t j : miss_e) {
             const int32_t e = row[j];
             const size_t gid = (size_t) il * n_expert + e;
             int32_t s = slot_of[gid];             // the same expert may appear twice in a row
             if (s < 0) {
                 s = take_slot();
-                const size_t nbu = src.up->nb[2], nbd = src.down->nb[2];
                 const char * pg = (const char *) src.gate->data + (size_t) e * nb2;
                 const char * pu = (const char *) src.up->data   + (size_t) e * nbu;
                 const char * pd = (const char *) src.down->data + (size_t) e * nbd;
                 if (staging) {
-                    memcpy(staging, pg, nb2); memcpy(staging + nb2, pu, nbu); memcpy(staging + nb2 + nbu, pd, nbd);
-                    pg = (const char *) staging; pu = pg + nb2; pd = pu + nbu;
+                    if (n_inflight == staging_n) {          // staging full: drain the queued copies
+                        if (backend) ggml_backend_synchronize(backend);
+                        n_inflight = 0;
+                    }
+                    uint8_t * st = staging + (size_t) n_inflight * (nb2 + nbu + nbd);
+                    memcpy(st, pg, nb2); memcpy(st + nb2, pu, nbu); memcpy(st + nb2 + nbu, pd, nbd);
+                    pg = (const char *) st; pu = pg + nb2; pd = pu + nbu;
+                    n_inflight++;
                 }
-                ggml_backend_tensor_set(t_gate, pg, (size_t) s * nb2, nb2);
-                ggml_backend_tensor_set(t_up,   pu, (size_t) s * nbu, nbu);
-                ggml_backend_tensor_set(t_down, pd, (size_t) s * nbd, nbd);
-                bytes_h2d += nb2 + src.up->nb[2] + src.down->nb[2];
+                if (staging && backend) {
+                    // page-locked source:真 async on the device stream, one synchronize per token below
+                    ggml_backend_tensor_set_async(backend, t_gate, pg, (size_t) s * nb2, nb2);
+                    ggml_backend_tensor_set_async(backend, t_up,   pu, (size_t) s * nbu, nbu);
+                    ggml_backend_tensor_set_async(backend, t_down, pd, (size_t) s * nbd, nbd);
+                } else {
+                    ggml_backend_tensor_set(t_gate, pg, (size_t) s * nb2, nb2);
+                    ggml_backend_tensor_set(t_up,   pu, (size_t) s * nbu, nbu);
+                    ggml_backend_tensor_set(t_down, pd, (size_t) s * nbd, nbd);
+                }
+                bytes_h2d += nb2 + nbu + nbd;
                 slot_of[gid] = s; gid_of[s] = (int32_t) gid;
                 misses++;
             }
             orow[j] = s;
+        }
+        if (staging && backend && n_inflight > 0) {
+            ggml_backend_synchronize(backend);      // the staging area is reused by the next token / layer
         }
     }
 }

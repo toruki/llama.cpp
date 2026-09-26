@@ -725,7 +725,11 @@ void llama_context::sched_reserve() {
             throw std::runtime_error("expert cache needs a GPU device");
         }
         try {
-            ecache.reset(new llama_expert_cache(model, model.devices[0].dev, cparams.expert_cache_slots));
+            ggml_backend_t dev_backend = nullptr;
+            for (auto & b : backends) {
+                if (ggml_backend_get_device(b.get()) == model.devices[0].dev) { dev_backend = b.get(); break; }
+            }
+            ecache.reset(new llama_expert_cache(model, model.devices[0].dev, dev_backend, cparams.expert_cache_slots));
         } catch (const std::exception & e) {
             // e.g. a probe context created without the CPU override for the routed experts
             LLAMA_LOG_WARN("%s: expert cache disabled: %s\n", __func__, e.what());
