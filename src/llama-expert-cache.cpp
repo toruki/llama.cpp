@@ -13,7 +13,7 @@
 
 llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_dev_t dev, ggml_backend_t backend_, uint32_t slots_)
     : slots(slots_), n_layer((int) model.hparams.n_layer()), n_expert((int) model.hparams.n_expert), backend(backend_), dev_(dev) {
-    if (slots < 2 * model.hparams.n_expert_used) {
+    if (slots < 2 * model.hparams.n_expert_used_max()) {
         throw std::runtime_error("expert cache: too few slots");
     }
     per_layer.resize(n_layer);
@@ -128,7 +128,7 @@ llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_d
     // device transfer is a single DMA instead of the driver's chunked pageable copy
     if (const char * env = getenv("LLAMA_EXPERT_CACHE_STAGING"); env && atoi(env) > 0) {
         ggml_backend_buffer_type_t hbuft = ggml_backend_dev_host_buffer_type(dev);
-        staging_n = (int) model.hparams.n_expert_used;                 // misses of one token, copied asynchronously
+        staging_n = (int) model.hparams.n_expert_used_max();                 // misses of one token, copied asynchronously
         const size_t need = (size_t) staging_n * (g0->nb[2] + u0->nb[2] + d0->nb[2]);
         if (hbuft) {
             staging_buf.reset(ggml_backend_buft_alloc_buffer(hbuft, need));
@@ -165,7 +165,7 @@ llama_expert_cache::llama_expert_cache(const llama_model & model, ggml_backend_d
                 const ggml_tensor * ts[3] = {src.gate, src.up, src.down};
                 for (int t = 0; t < 3; ++t) { hs[(size_t) il * 3 + t] = ts[t]->data; hb[(size_t) il * 3 + t] = ggml_nbytes(ts[t]); }
             }
-            prm.n_layer = n_layer; prm.n_expert = n_expert; prm.n_expert_used = (int32_t) model.hparams.n_expert_used; prm.slots = (int32_t) slots;
+            prm.n_layer = n_layer; prm.n_expert = n_expert; prm.n_expert_used = (int32_t) model.hparams.n_expert_used_max(); prm.slots = (int32_t) slots;
             prm.host_src = hs.data(); prm.host_bytes = hb.data();
             prm.bank[0] = t_gate->data; prm.bank[1] = t_up->data; prm.bank[2] = t_down->data;
             prm.nb[0] = t_gate->nb[2]; prm.nb[1] = t_up->nb[2]; prm.nb[2] = t_down->nb[2];

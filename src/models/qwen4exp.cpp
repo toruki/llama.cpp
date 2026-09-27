@@ -825,7 +825,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
             v_sel = ggml_reshape_4d(ctx0, v_sel, v_cache->ne[0], v_cache->ne[1], width_pad, 1);
             cb(k_sel, "qsa_k_sel", il);
 
-            ggml_tensor * cur = build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask_sel, nullptr, nullptr, kq_scale, il);
+            ggml_tensor * cur = build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask_sel, nullptr, nullptr, width_pad, kq_scale, il);
             cb(cur, "kqv_out", il);
             if (inp->self_v_rot) {
                 cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
